@@ -53,8 +53,21 @@ spreadsheet = None
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
-def get_moscow_date():
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+def get_moscow_now():
+    return datetime.now(MOSCOW_TZ)
+
+
+def is_working_hours():
+    now = get_moscow_now()
+    hour = now.hour
+    return hour >= 15 or hour < 8
+
+
+def get_working_day_date():
+    now = get_moscow_now()
+    if now.hour < 8:
+        now = now - timedelta(days=1)
+    return now.strftime("%Y-%m-%d")
 
 
 def get_bot_currency(bot_token):
@@ -247,7 +260,7 @@ def db_mark_invite_used(code):
 
 
 def db_add_daily_total(bot_token, amount):
-    date = get_moscow_date()
+    date = get_working_day_date()
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO daily_totals (bot_token, date, total) VALUES (?, ?, ?) "
@@ -259,7 +272,7 @@ def db_add_daily_total(bot_token, amount):
 
 
 def db_get_daily_total(bot_token):
-    date = get_moscow_date()
+    date = get_working_day_date()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     row = c.execute("SELECT total FROM daily_totals WHERE bot_token = ? AND date = ?", (bot_token, date)).fetchone()
@@ -773,12 +786,16 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pseudonym=receipt_data["pseudonym"],
                 photo_url=photo_url
             )
-            db_add_daily_total(bot_token, amount)
+            if is_working_hours():
+                db_add_daily_total(bot_token, amount)
             logger.info(f"Added receipt to Google Sheets: {amount} {currency}")
 
-    daily_total = db_get_daily_total(bot_token)
     currency_for_total = receipt_data.get("currency") or get_bot_currency(bot_token)
-    daily_line = f"\nИтого за сегодня: {daily_total} {currency_for_total}"
+    if is_working_hours():
+        daily_total = db_get_daily_total(bot_token)
+        daily_line = f"\nИтого за сегодня: {daily_total} {currency_for_total}"
+    else:
+        daily_line = "\nНерабочие часы (08:00–15:00 МСК)"
 
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
