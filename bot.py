@@ -4,7 +4,7 @@ import time
 import random
 import string
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -48,6 +48,13 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
 google_sheets_client = None
 spreadsheet = None
+
+
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+
+def get_moscow_date():
+    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
 
 
 def get_bot_currency(bot_token):
@@ -194,6 +201,12 @@ def init_db():
         expires_at REAL,
         used INTEGER
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS daily_totals (
+        bot_token TEXT,
+        date TEXT,
+        total REAL DEFAULT 0,
+        PRIMARY KEY (bot_token, date)
+    )""")
     conn.commit()
     conn.close()
 
@@ -231,6 +244,27 @@ def db_mark_invite_used(code):
     conn.execute("UPDATE invite_links_db SET used = 1 WHERE code = ?", (code,))
     conn.commit()
     conn.close()
+
+
+def db_add_daily_total(bot_token, amount):
+    date = get_moscow_date()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO daily_totals (bot_token, date, total) VALUES (?, ?, ?) "
+        "ON CONFLICT(bot_token, date) DO UPDATE SET total = total + ?",
+        (bot_token, date, amount, amount)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_daily_total(bot_token):
+    date = get_moscow_date()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute("SELECT total FROM daily_totals WHERE bot_token = ? AND date = ?", (bot_token, date)).fetchone()
+    conn.close()
+    return row[0] if row else 0.0
 
 
 def db_load_all():
@@ -739,13 +773,18 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pseudonym=receipt_data["pseudonym"],
                 photo_url=photo_url
             )
+            db_add_daily_total(bot_token, amount)
             logger.info(f"Added receipt to Google Sheets: {amount} {currency}")
+
+    daily_total = db_get_daily_total(bot_token)
+    currency_for_total = receipt_data.get("currency") or get_bot_currency(bot_token)
+    daily_line = f"\nИтого за сегодня: {daily_total} {currency_for_total}"
 
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
             try:
                 if "photo_id" in receipt_data:
-                    new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}"
+                    new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
                     await bot_to_use.edit_message_caption(
                         chat_id=uid,
                         message_id=msg_id,
@@ -753,7 +792,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=None
                     )
                 else:
-                    new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}"
+                    new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
                     await bot_to_use.edit_message_text(
                         chat_id=uid,
                         message_id=msg_id,
