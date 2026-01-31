@@ -42,6 +42,7 @@ receipts = {}
 bot_admins = {}
 invite_links = {}
 bot_geos = {}
+bot_shifts = {}
 user_states = {}
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
@@ -57,15 +58,24 @@ def get_moscow_now():
     return datetime.now(MOSCOW_TZ)
 
 
-def is_working_hours():
+def is_working_hours(bot_token):
+    shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
+    start = shift["start"]
+    end = shift["end"]
     now = get_moscow_now()
     hour = now.hour
-    return hour >= 15 or hour < 8
+    if start <= end:
+        return start <= hour <= end
+    else:
+        return hour >= start or hour <= end
 
 
-def get_working_day_date():
+def get_working_day_date(bot_token):
+    shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
+    start = shift["start"]
+    end = shift["end"]
     now = get_moscow_now()
-    if now.hour < 8:
+    if start > end and now.hour <= end:
         now = now - timedelta(days=1)
     return now.strftime("%Y-%m-%d")
 
@@ -220,6 +230,11 @@ def init_db():
         total REAL DEFAULT 0,
         PRIMARY KEY (bot_token, date)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS shifts (
+        bot_token TEXT PRIMARY KEY,
+        shift_start INTEGER DEFAULT 0,
+        shift_end INTEGER DEFAULT 23
+    )""")
     conn.commit()
     conn.close()
 
@@ -260,7 +275,7 @@ def db_mark_invite_used(code):
 
 
 def db_add_daily_total(bot_token, amount):
-    date = get_working_day_date()
+    date = get_working_day_date(bot_token)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO daily_totals (bot_token, date, total) VALUES (?, ?, ?) "
@@ -272,12 +287,19 @@ def db_add_daily_total(bot_token, amount):
 
 
 def db_get_daily_total(bot_token):
-    date = get_working_day_date()
+    date = get_working_day_date(bot_token)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     row = c.execute("SELECT total FROM daily_totals WHERE bot_token = ? AND date = ?", (bot_token, date)).fetchone()
     conn.close()
     return row[0] if row else 0.0
+
+
+def db_save_shift(bot_token, shift_start, shift_end):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO shifts VALUES (?, ?, ?)", (bot_token, shift_start, shift_end))
+    conn.commit()
+    conn.close()
 
 
 def db_load_all():
@@ -300,6 +322,10 @@ def db_load_all():
             "used": bool(used)
         }
 
+    shifts_list = c.execute("SELECT bot_token, shift_start, shift_end FROM shifts").fetchall()
+    for bot_token, shift_start, shift_end in shifts_list:
+        bot_shifts[bot_token] = {"start": shift_start, "end": shift_end}
+
     conn.close()
     return bots_list
 
@@ -308,6 +334,7 @@ def setup_secret_bot_handlers(app):
     app.add_handler(CommandHandler("start", secret_chat_start))
     app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CommandHandler("change_name", change_name_command))
+    app.add_handler(CommandHandler("setshift", setshift_command))
     app.add_handler(MessageHandler(filters.PHOTO, secret_chat_photo))
     app.add_handler(CallbackQueryHandler(debug_callback_handler), group=0)
     app.add_handler(CallbackQueryHandler(receipt_callback), group=1)
@@ -510,7 +537,7 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pseudonym = user_pseudonyms[bot_token][user_id]
 
         is_admin = bot_token in bot_admins and bot_admins[bot_token] == user_id
-        admin_text = "\n\nКоманды админа:\n/invite [минуты] - Сгенерировать ссылку-приглашение" if is_admin else ""
+        admin_text = "\n\nКоманды админа:\n/invite [минуты] - Сгенерировать ссылку-приглашение\n/setshift - Настроить рабочую смену" if is_admin else ""
 
         await update.message.reply_text(
             f"👋 С возвращением!\n\n"
@@ -533,7 +560,8 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Вы являетесь администратором этого чата.\n\n"
                 "Выберите свой псевдоним — отправьте любое имя\n\n"
                 "Команды:\n"
-                "/invite [минуты] - Сгенерировать ссылку-приглашение (по умолчанию: одноразовая)"
+                "/invite [минуты] - Сгенерировать ссылку-приглашение (по умолчанию: одноразовая)\n"
+                "/setshift - Настроить рабочую смену"
             )
 
 
@@ -584,6 +612,10 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     state = get_user_state(bot_token, user_id)
+    if state and state.get("mode") in ("setshift_start", "setshift_end"):
+        await handle_setshift_flow(update, context, bot_token, user_id, state, text)
+        return
+
     if state and state.get("mode") == "waiting_amount":
         clean_text = text.strip().replace(',', '.')
         try:
@@ -786,16 +818,17 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pseudonym=receipt_data["pseudonym"],
                 photo_url=photo_url
             )
-            if is_working_hours():
+            if is_working_hours(bot_token):
                 db_add_daily_total(bot_token, amount)
             logger.info(f"Added receipt to Google Sheets: {amount} {currency}")
 
     currency_for_total = receipt_data.get("currency") or get_bot_currency(bot_token)
-    if is_working_hours():
+    if is_working_hours(bot_token):
         daily_total = db_get_daily_total(bot_token)
-        daily_line = f"\nИтого за сегодня: {daily_total} {currency_for_total}"
+        daily_line = f"\nИтого за смену: {daily_total} {currency_for_total}"
     else:
-        daily_line = "\nНерабочие часы (08:00–15:00 МСК)"
+        shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
+        daily_line = f"\nНерабочее время (смена: {shift['start']}:00–{shift['end']}:00 МСК)"
 
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
@@ -899,6 +932,63 @@ async def change_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Был: {old_pseudonym}\n"
         f"Стал: {new_pseudonym}"
     )
+
+
+async def setshift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_token = context.application.bot.token
+
+    if bot_token not in bot_admins or bot_admins[bot_token] != user_id:
+        await update.message.reply_text("❌ Только администратор может настроить смену")
+        return
+
+    set_user_state(bot_token, user_id, {"mode": "setshift_start"})
+    current = bot_shifts.get(bot_token, {"start": 0, "end": 23})
+    await update.message.reply_text(
+        f"Текущая смена: с {current['start']}:00 до {current['end']}:00 МСК\n\n"
+        f"Введите час начала смены (от 0 до 23):"
+    )
+
+
+async def handle_setshift_flow(update, context, bot_token, user_id, state, text):
+    if state.get("mode") == "setshift_start":
+        try:
+            hour = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ Введите число от 0 до 23")
+            return True
+        if hour < 0 or hour > 23:
+            await update.message.reply_text("❌ Введите число от 0 до 23")
+            return True
+        set_user_state(bot_token, user_id, {"mode": "setshift_end", "start": hour})
+        await update.message.reply_text(f"Начало смены: {hour}:00 МСК\n\nВведите час окончания смены (от 0 до 23):")
+        return True
+
+    if state.get("mode") == "setshift_end":
+        try:
+            hour = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ Введите число от 0 до 23")
+            return True
+        if hour < 0 or hour > 23:
+            await update.message.reply_text("❌ Введите число от 0 до 23")
+            return True
+        start = state["start"]
+        bot_shifts[bot_token] = {"start": start, "end": hour}
+        db_save_shift(bot_token, start, hour)
+        set_user_state(bot_token, user_id, None)
+        if start <= hour:
+            desc = f"с {start}:00 до {hour}:00 МСК"
+        else:
+            desc = f"с {start}:00 до {hour}:00 МСК (через полночь)"
+        await update.message.reply_text(
+            f"✅ Смена установлена: {desc}\n\n"
+            f"Чеки будут учитываться только в рабочее время.",
+            reply_markup=get_main_keyboard()
+        )
+        return True
+
+    return False
 
 
 def main():
