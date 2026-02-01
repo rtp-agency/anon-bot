@@ -54,6 +54,27 @@ spreadsheet = None
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
+def format_amount(value):
+    num = float(value)
+    if num == int(num):
+        s = str(int(num))
+    else:
+        s = f"{num:.2f}"
+        integer_part, decimal_part = s.split(".")
+        formatted = ""
+        for i, ch in enumerate(reversed(integer_part)):
+            if i > 0 and i % 3 == 0:
+                formatted = "." + formatted
+            formatted = ch + formatted
+        return f"{formatted},{decimal_part}"
+    formatted = ""
+    for i, ch in enumerate(reversed(s)):
+        if i > 0 and i % 3 == 0:
+            formatted = "." + formatted
+        formatted = ch + formatted
+    return formatted
+
+
 def get_moscow_now():
     return datetime.now(MOSCOW_TZ)
 
@@ -156,6 +177,48 @@ def add_receipt_to_sheet(bot_username, amount, currency, pseudonym, photo_url=No
         return True
     except Exception as e:
         logger.error(f"Failed to add receipt to sheet: {e}")
+        return False
+
+
+def remove_receipt_from_sheet(bot_username, amount, pseudonym):
+    try:
+        if not spreadsheet:
+            return False
+
+        worksheet = spreadsheet.worksheet(bot_username)
+        all_rows = worksheet.get_all_values()
+
+        for i in range(len(all_rows) - 1, 0, -1):
+            row = all_rows[i]
+            if len(row) >= 4 and row[1] == str(amount) and row[3] == pseudonym:
+                worksheet.delete_rows(i + 1)
+                update_dashboard_decrement(bot_username)
+                logger.info(f"Removed receipt from {bot_username}: {amount} by {pseudonym}")
+                return True
+
+        logger.warning(f"Receipt not found in sheet {bot_username}: {amount} by {pseudonym}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to remove receipt from sheet: {e}")
+        return False
+
+
+def update_dashboard_decrement(bot_username):
+    try:
+        if not spreadsheet:
+            return False
+
+        dashboard = spreadsheet.worksheet("Dashboard")
+        cell = dashboard.find(bot_username)
+
+        if cell:
+            current = dashboard.cell(cell.row, 2).value
+            new_count = max(0, int(current or 0) - 1)
+            dashboard.update_cell(cell.row, 2, new_count)
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to decrement dashboard: {e}")
         return False
 
 
@@ -281,6 +344,17 @@ def db_add_daily_total(bot_token, amount):
         "INSERT INTO daily_totals (bot_token, date, total) VALUES (?, ?, ?) "
         "ON CONFLICT(bot_token, date) DO UPDATE SET total = total + ?",
         (bot_token, date, amount, amount)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_subtract_daily_total(bot_token, amount):
+    date = get_working_day_date(bot_token)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE daily_totals SET total = total - ? WHERE bot_token = ? AND date = ?",
+        (amount, bot_token, date)
     )
     conn.commit()
     conn.close()
@@ -627,7 +701,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         currency = get_bot_currency(bot_token)
         photo_id = state["photo_id"]
         pseudonym = user_pseudonyms[bot_token][user_id]
-        receipt_text = f"{amount} {currency}"
+        receipt_text = f"{format_amount(amount)} {currency}"
 
         set_user_state(bot_token, user_id, None)
 
@@ -782,12 +856,23 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "approve":
         receipt_data["status"] = "approved"
         status_text = f"Статус: Принят ✅ ({approver_name})"
-    else:
+    elif action == "decline":
         receipt_data["status"] = "declined"
         status_text = f"Статус: Отклонён ❌ ({approver_name})"
+    elif action == "cancel":
+        if receipt_data.get("status") != "approved":
+            await query.answer("Этот чек не был принят", show_alert=True)
+            return
+        receipt_data["status"] = "cancelled"
+        status_text = f"Статус: Отменён 🚫 ({approver_name})"
+    else:
+        return
 
-    action_text = "принят" if action == "approve" else "отклонён"
-    await query.answer(f"Чек {action_text}!")
+    if action == "cancel":
+        await query.answer("Чек отменён!")
+    else:
+        action_text = "принят" if action == "approve" else "отклонён"
+        await query.answer(f"Чек {action_text}!")
 
     bot_app = None
     for chat_id, bot_info in created_bots.items():
@@ -821,13 +906,35 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_add_daily_total(bot_token, amount)
             logger.info(f"Added receipt to Google Sheets: {amount} {currency}")
 
+    elif action == "cancel":
+        bot_username = bot_to_use.username if hasattr(bot_to_use, 'username') else "unknown"
+        amount = receipt_data.get("amount")
+        currency = receipt_data.get("currency")
+
+        if amount:
+            remove_receipt_from_sheet(
+                bot_username=bot_username,
+                amount=amount,
+                pseudonym=receipt_data["pseudonym"]
+            )
+            if is_working_hours(bot_token):
+                db_subtract_daily_total(bot_token, amount)
+            logger.info(f"Cancelled receipt: {amount} {currency} by {approver_name}")
+
     currency_for_total = receipt_data.get("currency") or get_bot_currency(bot_token)
     if is_working_hours(bot_token):
         daily_total = db_get_daily_total(bot_token)
-        daily_line = f"\nИтого за смену: {daily_total} {currency_for_total}"
+        daily_line = f"\nИтого за смену: {format_amount(daily_total)} {currency_for_total}"
     else:
         shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
         daily_line = f"\nНерабочее время (смена: {shift['start']}:00–{shift['end']}:00 МСК)"
+
+    if action == "approve":
+        cancel_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚫 Отменить", callback_data=f"receipt_cancel_{receipt_id}")]
+        ])
+    else:
+        cancel_markup = None
 
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
@@ -838,7 +945,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=uid,
                         message_id=msg_id,
                         caption=new_caption,
-                        reply_markup=None
+                        reply_markup=cancel_markup
                     )
                 else:
                     new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
@@ -846,7 +953,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=uid,
                         message_id=msg_id,
                         text=new_text,
-                        reply_markup=None
+                        reply_markup=cancel_markup
                     )
             except Exception as e:
                 logger.error(f"Error updating receipt for {uid}: {e}", exc_info=True)
