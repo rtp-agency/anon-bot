@@ -633,10 +633,10 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         receipt_id = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
 
-        keyboard = [[
-            InlineKeyboardButton("Принять", callback_data=f"receipt_approve_{receipt_id}"),
-            InlineKeyboardButton("Отклонить", callback_data=f"receipt_decline_{receipt_id}")
-        ]]
+        keyboard = [
+            [InlineKeyboardButton("✅ Принять", callback_data=f"receipt_approve_{receipt_id}")],
+            [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         receipts[receipt_id] = {
@@ -775,12 +775,15 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     receipt_data = receipts[receipt_id]
 
+    approver_id = query.from_user.id
+    approver_name = user_pseudonyms.get(bot_token, {}).get(approver_id, "Неизвестный")
+
     if action == "approve":
         receipt_data["status"] = "approved"
-        status_text = "Статус: Принят ✅"
+        status_text = f"Статус: Принят ✅ ({approver_name})"
     else:
         receipt_data["status"] = "declined"
-        status_text = "Статус: Отклонён ❌"
+        status_text = f"Статус: Отклонён ❌ ({approver_name})"
 
     action_text = "принят" if action == "approve" else "отклонён"
     await query.answer(f"Чек {action_text}!")
