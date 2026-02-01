@@ -745,10 +745,6 @@ async def debug_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"!!! DEBUG: Callback query received: {update.callback_query.data}")
         logger.info(f"!!! DEBUG: From user: {update.callback_query.from_user.id}")
         logger.info(f"!!! DEBUG: Bot: {context.bot.username}")
-        try:
-            await update.callback_query.answer("Debug: callback получен!", show_alert=True)
-        except:
-            pass
 
 
 async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -775,6 +771,11 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     receipt_data = receipts[receipt_id]
 
+    bot_token = receipt_data.get("bot_token")
+    if not bot_token:
+        logger.error("No bot_token in receipt_data!")
+        return
+
     approver_id = query.from_user.id
     approver_name = user_pseudonyms.get(bot_token, {}).get(approver_id, "Неизвестный")
 
@@ -787,11 +788,6 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action_text = "принят" if action == "approve" else "отклонён"
     await query.answer(f"Чек {action_text}!")
-
-    bot_token = receipt_data.get("bot_token")
-    if not bot_token:
-        logger.error("No bot_token in receipt_data!")
-        return
 
     bot_app = None
     for chat_id, bot_info in created_bots.items():
