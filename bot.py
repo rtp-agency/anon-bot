@@ -40,10 +40,13 @@ created_bots = {}
 user_pseudonyms = {}
 receipts = {}
 bot_admins = {}
+bot_chat_admins = {}
 invite_links = {}
 bot_geos = {}
 bot_shifts = {}
 user_states = {}
+bot_requisites = {}
+message_map = {}
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
@@ -106,8 +109,14 @@ def get_bot_currency(bot_token):
     return GEO_CURRENCIES.get(geo, "ARS")
 
 
+def is_chat_admin(bot_token, user_id):
+    if bot_token in bot_admins and bot_admins[bot_token] == user_id:
+        return True
+    return user_id in bot_chat_admins.get(bot_token, set())
+
+
 def get_main_keyboard():
-    keyboard = [["Отправить фото"]]
+    keyboard = [["Отправить фото", "Реквизиты"]]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -298,6 +307,15 @@ def init_db():
         shift_start INTEGER DEFAULT 0,
         shift_end INTEGER DEFAULT 23
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS chat_admins (
+        bot_token TEXT,
+        user_id INTEGER,
+        PRIMARY KEY (bot_token, user_id)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS requisites (
+        bot_token TEXT PRIMARY KEY,
+        text TEXT
+    )""")
     conn.commit()
     conn.close()
 
@@ -369,6 +387,27 @@ def db_get_daily_total(bot_token):
     return row[0] if row else 0.0
 
 
+def db_add_chat_admin(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR IGNORE INTO chat_admins VALUES (?, ?)", (bot_token, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_remove_chat_admin(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM chat_admins WHERE bot_token = ? AND user_id = ?", (bot_token, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_save_requisites(bot_token, text):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO requisites VALUES (?, ?)", (bot_token, text))
+    conn.commit()
+    conn.close()
+
+
 def db_save_shift(bot_token, shift_start, shift_end):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("INSERT OR REPLACE INTO shifts VALUES (?, ?, ?)", (bot_token, shift_start, shift_end))
@@ -400,6 +439,16 @@ def db_load_all():
     for bot_token, shift_start, shift_end in shifts_list:
         bot_shifts[bot_token] = {"start": shift_start, "end": shift_end}
 
+    admins_list = c.execute("SELECT bot_token, user_id FROM chat_admins").fetchall()
+    for bot_token, user_id in admins_list:
+        if bot_token not in bot_chat_admins:
+            bot_chat_admins[bot_token] = set()
+        bot_chat_admins[bot_token].add(user_id)
+
+    reqs_list = c.execute("SELECT bot_token, text FROM requisites").fetchall()
+    for bot_token, text in reqs_list:
+        bot_requisites[bot_token] = text
+
     conn.close()
     return bots_list
 
@@ -409,6 +458,9 @@ def setup_secret_bot_handlers(app):
     app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CommandHandler("change_name", change_name_command))
     app.add_handler(CommandHandler("setshift", setshift_command))
+    app.add_handler(CommandHandler("op", op_command))
+    app.add_handler(CommandHandler("deop", deop_command))
+    app.add_handler(CommandHandler("chrq", chrq_command))
     app.add_handler(MessageHandler(filters.PHOTO, secret_chat_photo))
     app.add_handler(CallbackQueryHandler(debug_callback_handler), group=0)
     app.add_handler(CallbackQueryHandler(receipt_callback), group=1)
@@ -452,6 +504,7 @@ async def start_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Добро пожаловать в менеджер секретных чатов\n\n"
         "Команды:\n"
         "/create_secret_chat - Создать нового бота для секретного чата\n"
+        "/add <user_id> - Добавить пользователя в whitelist\n"
         "Отправьте токен бота от @BotFather, чтобы создать нового бота"
     )
 
@@ -602,6 +655,22 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ Добро пожаловать в секретный чат!\n\n"
                 "Выберите свой псевдоним — отправьте любое имя"
             )
+
+            tg_username = update.effective_user.username
+            tg_display = f"@{tg_username}" if tg_username else "без username"
+            admin_ids = set()
+            if bot_token in bot_admins:
+                admin_ids.add(bot_admins[bot_token])
+            admin_ids.update(bot_chat_admins.get(bot_token, set()))
+            for aid in admin_ids:
+                try:
+                    await context.bot.send_message(
+                        chat_id=aid,
+                        text=f"🔔 Новый участник присоединился:\n{tg_display} (ID: {user_id})"
+                    )
+                except Exception:
+                    pass
+
             return
         else:
             await update.message.reply_text("❌ Недействительная ссылка-приглашение")
@@ -610,8 +679,13 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bot_token in user_pseudonyms and user_id in user_pseudonyms[bot_token]:
         pseudonym = user_pseudonyms[bot_token][user_id]
 
-        is_admin = bot_token in bot_admins and bot_admins[bot_token] == user_id
-        admin_text = "\n\nКоманды админа:\n/invite [минуты] - Сгенерировать ссылку-приглашение\n/setshift - Настроить рабочую смену" if is_admin else ""
+        is_admin = is_chat_admin(bot_token, user_id)
+        admin_text = ("\n\nКоманды админа:\n"
+            "/invite [минуты] - Ссылка-приглашение\n"
+            "/setshift - Настроить смену\n"
+            "/chrq - Изменить реквизиты\n"
+            "/op <id> - Назначить админа\n"
+            "/deop <id> - Снять админа") if is_admin else ""
 
         await update.message.reply_text(
             f"👋 С возвращением!\n\n"
@@ -622,7 +696,7 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
     else:
-        is_admin = bot_token in bot_admins and bot_admins[bot_token] == user_id
+        is_admin = is_chat_admin(bot_token, user_id)
         if not is_admin:
             await update.message.reply_text(
                 "❌ Это приватный чат. Для входа нужна ссылка-приглашение.\n\n"
@@ -634,8 +708,11 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Вы являетесь администратором этого чата.\n\n"
                 "Выберите свой псевдоним — отправьте любое имя\n\n"
                 "Команды:\n"
-                "/invite [минуты] - Сгенерировать ссылку-приглашение (по умолчанию: одноразовая)\n"
-                "/setshift - Настроить рабочую смену"
+                "/invite [минуты] - Ссылка-приглашение\n"
+                "/setshift - Настроить смену\n"
+                "/chrq - Изменить реквизиты\n"
+                "/op <id> - Назначить админа\n"
+                "/deop <id> - Снять админа"
             )
 
 
@@ -664,7 +741,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_pseudonyms[bot_token][user_id] = text
         db_add_pseudonym(bot_token, user_id, text)
 
-        is_admin = bot_token in bot_admins and bot_admins[bot_token] == user_id
+        is_admin = is_chat_admin(bot_token, user_id)
         admin_text = "\n/invite [минуты] - Сгенерировать ссылку-приглашение" if is_admin else ""
 
         await update.message.reply_text(
@@ -685,7 +762,29 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    if text == "Реквизиты":
+        reqs = bot_requisites.get(bot_token)
+        if reqs:
+            await update.message.reply_text(f"📋 Актуальные реквизиты:\n\n{reqs}")
+        else:
+            await update.message.reply_text("📋 Реквизиты ещё не установлены")
+        return
+
     state = get_user_state(bot_token, user_id)
+
+    if state and state.get("mode") == "waiting_requisites":
+        bot_requisites[bot_token] = text
+        db_save_requisites(bot_token, text)
+        set_user_state(bot_token, user_id, None)
+        await update.message.reply_text("✅ Реквизиты обновлены!")
+        for uid in user_pseudonyms[bot_token].keys():
+            if uid != user_id:
+                try:
+                    await context.bot.send_message(chat_id=uid, text="📋 Реквизиты были обновлены")
+                except Exception:
+                    pass
+        return
+
     if state and state.get("mode") in ("setshift_start", "setshift_end"):
         await handle_setshift_flow(update, context, bot_token, user_id, state, text)
         return
@@ -699,7 +798,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         currency = get_bot_currency(bot_token)
-        photo_id = state["photo_id"]
+        photo_id = state.get("photo_id")
+        document_id = state.get("document_id")
         pseudonym = user_pseudonyms[bot_token][user_id]
         receipt_text = f"{format_amount(amount)} {currency}"
 
@@ -713,40 +813,79 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        receipts[receipt_id] = {
+        receipt_data = {
             "text": receipt_text,
             "status": "pending",
             "pseudonym": pseudonym,
-            "photo_id": photo_id,
             "bot_token": bot_token,
             "amount": amount,
             "currency": currency,
         }
+        if photo_id:
+            receipt_data["photo_id"] = photo_id
+        if document_id:
+            receipt_data["document_id"] = document_id
+
+        receipts[receipt_id] = receipt_data
 
         for uid in user_pseudonyms[bot_token].keys():
             try:
-                sent = await context.bot.send_photo(
-                    chat_id=uid,
-                    photo=photo_id,
-                    caption=f"{pseudonym}: {receipt_text}\n\nНовый чек\nСтатус: Ожидание",
-                    reply_markup=reply_markup
-                )
+                caption = f"{pseudonym}: {receipt_text}\n\nНовый чек\nСтатус: Ожидание"
+                if photo_id:
+                    sent = await context.bot.send_photo(
+                        chat_id=uid,
+                        photo=photo_id,
+                        caption=caption,
+                        reply_markup=reply_markup
+                    )
+                elif document_id:
+                    sent = await context.bot.send_document(
+                        chat_id=uid,
+                        document=document_id,
+                        caption=caption,
+                        reply_markup=reply_markup
+                    )
+                else:
+                    continue
                 if "message_ids" not in receipts[receipt_id]:
                     receipts[receipt_id]["message_ids"] = {}
                 receipts[receipt_id]["message_ids"][uid] = sent.message_id
             except Exception as e:
                 logger.error(f"Error sending receipt to {uid}: {e}")
 
-        logger.info(f"Receipt created: {receipt_id} - {amount} {currency} by {pseudonym}")
+        file_type = "PDF" if document_id else "photo"
+        logger.info(f"Receipt created ({file_type}): {receipt_id} - {amount} {currency} by {pseudonym}")
         return
 
     pseudonym = user_pseudonyms[bot_token][user_id]
-    message_text = f"{pseudonym}: {text}"
+
+    reply_prefix = ""
+    if update.message.reply_to_message:
+        reply_msg_id = update.message.reply_to_message.message_id
+        original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
+        if original:
+            orig_text = original["text"]
+            if len(orig_text) > 50:
+                orig_text = orig_text[:50] + "..."
+            reply_prefix = f"┌ {original['pseudonym']}: {orig_text}\n└ "
+
+    message_text = f"{reply_prefix}{pseudonym}: {text}"
+
+    if bot_token not in message_map:
+        message_map[bot_token] = {}
+    message_map[bot_token][(user_id, update.message.message_id)] = {
+        "pseudonym": pseudonym,
+        "text": text
+    }
 
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
-                await context.bot.send_message(chat_id=uid, text=message_text)
+                sent = await context.bot.send_message(chat_id=uid, text=message_text)
+                message_map[bot_token][(uid, sent.message_id)] = {
+                    "pseudonym": pseudonym,
+                    "text": text
+                }
             except Exception as e:
                 logger.error(f"Error sending to {uid}: {e}")
 
@@ -794,6 +933,12 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pseudonym = user_pseudonyms[bot_token][user_id]
+
+    if update.message.document and update.message.document.mime_type == "application/pdf":
+        doc_id = update.message.document.file_id
+        set_user_state(bot_token, user_id, {"mode": "waiting_amount", "document_id": doc_id})
+        await update.message.reply_text("Введите сумму чека (только цифры):")
+        return
 
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
@@ -939,7 +1084,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
             try:
-                if "photo_id" in receipt_data:
+                if "photo_id" in receipt_data or "document_id" in receipt_data:
                     new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
                     await bot_to_use.edit_message_caption(
                         chat_id=uid,
@@ -965,7 +1110,7 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
 
-    if bot_token not in bot_admins or bot_admins[bot_token] != user_id:
+    if not is_chat_admin(bot_token, user_id):
         await update.message.reply_text("❌ Только администратор чата может генерировать ссылки-приглашения")
         return
 
@@ -1012,6 +1157,86 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def op_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_token = context.application.bot.token
+
+    if not is_chat_admin(bot_token, user_id):
+        await update.message.reply_text("❌ Только админы могут использовать эту команду")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /op <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+
+    if target_id not in user_pseudonyms.get(bot_token, {}):
+        await update.message.reply_text("❌ Пользователь не найден в этом чате")
+        return
+
+    if is_chat_admin(bot_token, target_id):
+        await update.message.reply_text("ℹ️ Этот пользователь уже является админом")
+        return
+
+    if bot_token not in bot_chat_admins:
+        bot_chat_admins[bot_token] = set()
+    bot_chat_admins[bot_token].add(target_id)
+    db_add_chat_admin(bot_token, target_id)
+
+    target_name = user_pseudonyms[bot_token].get(target_id, str(target_id))
+    await update.message.reply_text(f"✅ {target_name} назначен админом")
+
+
+async def deop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_token = context.application.bot.token
+
+    if not is_chat_admin(bot_token, user_id):
+        await update.message.reply_text("❌ Только админы могут использовать эту команду")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /deop <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+
+    if bot_token in bot_admins and bot_admins[bot_token] == target_id:
+        await update.message.reply_text("❌ Нельзя снять права создателя чата")
+        return
+
+    if target_id not in bot_chat_admins.get(bot_token, set()):
+        await update.message.reply_text("ℹ️ Этот пользователь не является админом")
+        return
+
+    bot_chat_admins[bot_token].discard(target_id)
+    db_remove_chat_admin(bot_token, target_id)
+
+    target_name = user_pseudonyms.get(bot_token, {}).get(target_id, str(target_id))
+    await update.message.reply_text(f"✅ {target_name} больше не админ")
+
+
+async def chrq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_token = context.application.bot.token
+
+    if not is_chat_admin(bot_token, user_id):
+        await update.message.reply_text("❌ Только админы могут менять реквизиты")
+        return
+
+    set_user_state(bot_token, user_id, {"mode": "waiting_requisites"})
+    await update.message.reply_text("📋 Отправьте новые реквизиты (в любом формате):")
+
+
 async def change_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
@@ -1044,7 +1269,7 @@ async def setshift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
 
-    if bot_token not in bot_admins or bot_admins[bot_token] != user_id:
+    if not is_chat_admin(bot_token, user_id):
         await update.message.reply_text("❌ Только администратор может настроить смену")
         return
 
@@ -1097,6 +1322,30 @@ async def handle_setshift_flow(update, context, bot_token, user_id, state, text)
     return False
 
 
+async def add_to_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in WHITELIST:
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /add <user_id>")
+        return
+
+    try:
+        new_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+
+    if new_id in WHITELIST:
+        await update.message.reply_text("ℹ️ Этот пользователь уже в whitelist")
+        return
+
+    WHITELIST.append(new_id)
+    await update.message.reply_text(f"✅ Пользователь {new_id} добавлен в whitelist")
+
+
 def main():
     if not ADMIN_BOT_TOKEN:
         raise ValueError("ADMIN_BOT_TOKEN environment variable is required")
@@ -1111,6 +1360,7 @@ def main():
 
     admin_app.add_handler(CommandHandler("start", start_admin))
     admin_app.add_handler(CommandHandler("create_secret_chat", create_secret_chat))
+    admin_app.add_handler(CommandHandler("add", add_to_whitelist))
     admin_app.add_handler(CallbackQueryHandler(admin_geo_callback))
     admin_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_message))
 
