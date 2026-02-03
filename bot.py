@@ -212,6 +212,28 @@ def remove_receipt_from_sheet(bot_username, amount, pseudonym):
         return False
 
 
+def update_receipt_in_sheet(bot_username, old_amount, new_amount, pseudonym):
+    try:
+        if not spreadsheet:
+            return False
+
+        worksheet = spreadsheet.worksheet(bot_username)
+        all_rows = worksheet.get_all_values()
+
+        for i in range(len(all_rows) - 1, 0, -1):
+            row = all_rows[i]
+            if len(row) >= 4 and row[1] == str(old_amount) and row[3] == pseudonym:
+                worksheet.update_cell(i + 1, 2, str(new_amount))
+                logger.info(f"Updated receipt in {bot_username}: {old_amount} -> {new_amount} by {pseudonym}")
+                return True
+
+        logger.warning(f"Receipt not found for update in {bot_username}: {old_amount} by {pseudonym}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to update receipt in sheet: {e}")
+        return False
+
+
 def update_dashboard_decrement(bot_username):
     try:
         if not spreadsheet:
@@ -505,6 +527,7 @@ async def start_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/create_secret_chat - Создать нового бота для секретного чата\n"
         "/add <user_id> - Добавить пользователя в whitelist\n"
+        "/msg <текст> - Массовая рассылка по всем ботам\n"
         "Отправьте токен бота от @BotFather, чтобы создать нового бота"
     )
 
@@ -789,6 +812,86 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_setshift_flow(update, context, bot_token, user_id, state, text)
         return
 
+    if state and state.get("mode") == "waiting_edit_amount":
+        clean_text = text.strip().replace(',', '.')
+        try:
+            new_amount = float(clean_text)
+        except ValueError:
+            await update.message.reply_text("❌ Введите только цифры!")
+            return
+
+        receipt_id = state.get("receipt_id")
+        if receipt_id not in receipts:
+            await update.message.reply_text("❌ Чек не найден")
+            set_user_state(bot_token, user_id, None)
+            return
+
+        receipt_data = receipts[receipt_id]
+        old_amount = receipt_data.get("amount")
+        currency = receipt_data.get("currency") or get_bot_currency(bot_token)
+        editor_name = user_pseudonyms.get(bot_token, {}).get(user_id, "Неизвестный")
+
+        bot_app = None
+        for cid, bot_info in created_bots.items():
+            if bot_info["token"] == receipt_data.get("bot_token"):
+                bot_app = bot_info["application"]
+                break
+        bot_to_use = bot_app.bot if bot_app else context.bot
+        bot_username = bot_to_use.username if hasattr(bot_to_use, 'username') else "unknown"
+
+        update_receipt_in_sheet(bot_username, old_amount, new_amount, receipt_data["pseudonym"])
+
+        if is_working_hours(bot_token):
+            diff = new_amount - old_amount
+            if diff > 0:
+                db_add_daily_total(bot_token, diff)
+            elif diff < 0:
+                db_subtract_daily_total(bot_token, abs(diff))
+
+        receipt_data["amount"] = new_amount
+        receipt_data["text"] = f"{format_amount(new_amount)} {currency}"
+        receipt_data["edited_by"] = editor_name
+
+        if is_working_hours(bot_token):
+            daily_total = db_get_daily_total(bot_token)
+            daily_line = f"\nИтого за смену: {format_amount(daily_total)} {currency}"
+        else:
+            shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
+            daily_line = f"\nНерабочее время (смена: {shift['start']}:00–{shift['end']}:00 МСК)"
+
+        status_text = f"Статус: Принят ✅\nИзменён: {editor_name} ({format_amount(old_amount)} → {format_amount(new_amount)})"
+
+        action_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")]
+        ])
+
+        if "message_ids" in receipt_data:
+            for uid, msg_id in receipt_data["message_ids"].items():
+                try:
+                    if "photo_id" in receipt_data or "document_id" in receipt_data:
+                        new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
+                        await bot_to_use.edit_message_caption(
+                            chat_id=uid,
+                            message_id=msg_id,
+                            caption=new_caption,
+                            reply_markup=action_markup
+                        )
+                    else:
+                        new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
+                        await bot_to_use.edit_message_text(
+                            chat_id=uid,
+                            message_id=msg_id,
+                            text=new_text,
+                            reply_markup=action_markup
+                        )
+                except Exception as e:
+                    logger.error(f"Error updating edited receipt for {uid}: {e}")
+
+        set_user_state(bot_token, user_id, None)
+        await update.message.reply_text(f"✅ Сумма чека изменена: {format_amount(old_amount)} → {format_amount(new_amount)} {currency}")
+        logger.info(f"Receipt {receipt_id} edited by {editor_name}: {old_amount} -> {new_amount}")
+        return
+
     if state and state.get("mode") == "waiting_amount":
         clean_text = text.strip().replace(',', '.')
         try:
@@ -1001,23 +1104,27 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "approve":
         receipt_data["status"] = "approved"
         status_text = f"Статус: Принят ✅ ({approver_name})"
+        await query.answer("Чек принят!")
     elif action == "decline":
         receipt_data["status"] = "declined"
         status_text = f"Статус: Отклонён ❌ ({approver_name})"
-    elif action == "cancel":
+        await query.answer("Чек отклонён!")
+    elif action == "edit":
         if receipt_data.get("status") != "approved":
             await query.answer("Этот чек не был принят", show_alert=True)
             return
-        receipt_data["status"] = "cancelled"
-        status_text = f"Статус: Отменён 🚫 ({approver_name})"
+        set_user_state(bot_token, approver_id, {"mode": "waiting_edit_amount", "receipt_id": receipt_id})
+        await query.answer("Введите новую сумму чека", show_alert=True)
+        return
+    elif action == "undo":
+        if receipt_data.get("status") != "declined":
+            await query.answer("Этот чек не был отклонён", show_alert=True)
+            return
+        receipt_data["status"] = "pending"
+        status_text = "Статус: Ожидание"
+        await query.answer("Чек возвращён на рассмотрение!")
     else:
         return
-
-    if action == "cancel":
-        await query.answer("Чек отменён!")
-    else:
-        action_text = "принят" if action == "approve" else "отклонён"
-        await query.answer(f"Чек {action_text}!")
 
     bot_app = None
     for chat_id, bot_info in created_bots.items():
@@ -1075,11 +1182,20 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         daily_line = f"\nНерабочее время (смена: {shift['start']}:00–{shift['end']}:00 МСК)"
 
     if action == "approve":
-        cancel_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚫 Отменить", callback_data=f"receipt_cancel_{receipt_id}")]
+        action_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")]
+        ])
+    elif action == "decline":
+        action_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩️ Назад", callback_data=f"receipt_undo_{receipt_id}")]
+        ])
+    elif action == "undo":
+        action_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Принять", callback_data=f"receipt_approve_{receipt_id}")],
+            [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")]
         ])
     else:
-        cancel_markup = None
+        action_markup = None
 
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
@@ -1090,7 +1206,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=uid,
                         message_id=msg_id,
                         caption=new_caption,
-                        reply_markup=cancel_markup
+                        reply_markup=action_markup
                     )
                 else:
                     new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
@@ -1098,7 +1214,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=uid,
                         message_id=msg_id,
                         text=new_text,
-                        reply_markup=cancel_markup
+                        reply_markup=action_markup
                     )
             except Exception as e:
                 logger.error(f"Error updating receipt for {uid}: {e}", exc_info=True)
@@ -1346,6 +1462,45 @@ async def add_to_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Пользователь {new_id} добавлен в whitelist")
 
 
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in WHITELIST:
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /msg <текст сообщения>")
+        return
+
+    message_text = " ".join(context.args)
+
+    total_users = 0
+    total_sent = 0
+    total_bots = 0
+
+    for bot_token, bot_info in created_bots.items():
+        bot_app = bot_info.get("application")
+        if not bot_app:
+            continue
+
+        total_bots += 1
+        users = user_pseudonyms.get(bot_token, {})
+
+        for uid in users.keys():
+            total_users += 1
+            try:
+                await bot_app.bot.send_message(chat_id=uid, text=f"📢 Рассылка:\n\n{message_text}")
+                total_sent += 1
+            except Exception as e:
+                logger.error(f"Failed to send broadcast to {uid}: {e}")
+
+    await update.message.reply_text(
+        f"✅ Рассылка завершена\n\n"
+        f"Ботов: {total_bots}\n"
+        f"Отправлено: {total_sent}/{total_users}"
+    )
+
+
 def main():
     if not ADMIN_BOT_TOKEN:
         raise ValueError("ADMIN_BOT_TOKEN environment variable is required")
@@ -1361,6 +1516,7 @@ def main():
     admin_app.add_handler(CommandHandler("start", start_admin))
     admin_app.add_handler(CommandHandler("create_secret_chat", create_secret_chat))
     admin_app.add_handler(CommandHandler("add", add_to_whitelist))
+    admin_app.add_handler(CommandHandler("msg", broadcast_message))
     admin_app.add_handler(CallbackQueryHandler(admin_geo_callback))
     admin_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_message))
 
