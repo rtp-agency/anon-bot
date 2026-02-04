@@ -825,14 +825,25 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == "📋 Реквизиты":
         reqs = bot_requisites.get(bot_token)
         if reqs:
+            req_text = reqs.get("text") or ""
             if reqs.get("photo_id"):
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=reqs["photo_id"],
-                    caption=f"📋 Актуальные реквизиты:\n\n{reqs.get('text', '')}"
-                )
+                try:
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=reqs["photo_id"],
+                        caption=f"📋 Актуальные реквизиты:\n\n{req_text}"
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending requisites photo: {e}")
+                    if req_text:
+                        await update.message.reply_text(f"📋 Актуальные реквизиты:\n\n{req_text}")
+                    else:
+                        await update.message.reply_text("📋 Ошибка при загрузке реквизитов. Попросите админа обновить их.")
             else:
-                await update.message.reply_text(f"📋 Актуальные реквизиты:\n\n{reqs.get('text', '')}")
+                if req_text:
+                    await update.message.reply_text(f"📋 Актуальные реквизиты:\n\n{req_text}")
+                else:
+                    await update.message.reply_text("📋 Реквизиты пустые. Попросите админа обновить их.")
         else:
             await update.message.reply_text("📋 Реквизиты ещё не установлены")
         return
@@ -1358,10 +1369,16 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     approver_name = user_pseudonyms.get(bot_token, {}).get(approver_id, "Неизвестный")
 
     if action == "approve":
+        if receipt_data.get("status") == "approved":
+            await query.answer("Этот чек уже принят", show_alert=True)
+            return
         receipt_data["status"] = "approved"
         status_text = f"Статус: Принят ✅ ({approver_name})"
         await query.answer("Чек принят!")
     elif action == "decline":
+        if receipt_data.get("status") == "declined":
+            await query.answer("Этот чек уже отклонён", show_alert=True)
+            return
         receipt_data["status"] = "declined"
         status_text = f"Статус: Отклонён ❌ ({approver_name})"
         await query.answer("Чек отклонён!")
