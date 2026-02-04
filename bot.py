@@ -47,6 +47,7 @@ bot_shifts = {}
 user_states = {}
 bot_requisites = {}
 message_map = {}
+banned_users = {}
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
@@ -115,8 +116,14 @@ def is_chat_admin(bot_token, user_id):
     return user_id in bot_chat_admins.get(bot_token, set())
 
 
-def get_main_keyboard():
-    keyboard = [["Отправить фото", "Реквизиты"]]
+def get_main_keyboard(is_admin=False):
+    keyboard = [
+        ["📷 Отправить фото", "📋 Реквизиты"],
+        ["✏️ Сменить ник"]
+    ]
+    if is_admin:
+        keyboard.append(["🔗 Инвайт", "⏰ Смена", "📝 Изм. реквизиты"])
+        keyboard.append(["👑 Назначить админа", "🚫 Снять админа", "👢 Кикнуть"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -336,7 +343,17 @@ def init_db():
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS requisites (
         bot_token TEXT PRIMARY KEY,
-        text TEXT
+        text TEXT,
+        photo_id TEXT
+    )""")
+    try:
+        c.execute("ALTER TABLE requisites ADD COLUMN photo_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+    c.execute("""CREATE TABLE IF NOT EXISTS banned_users (
+        bot_token TEXT,
+        user_id INTEGER,
+        PRIMARY KEY (bot_token, user_id)
     )""")
     conn.commit()
     conn.close()
@@ -352,6 +369,27 @@ def db_add_bot(token, username, admin_user_id, geo="argentina"):
 def db_add_pseudonym(bot_token, user_id, pseudonym):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("INSERT OR REPLACE INTO pseudonyms VALUES (?, ?, ?)", (bot_token, user_id, pseudonym))
+    conn.commit()
+    conn.close()
+
+
+def db_remove_pseudonym(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM pseudonyms WHERE bot_token = ? AND user_id = ?", (bot_token, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_ban_user(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR IGNORE INTO banned_users VALUES (?, ?)", (bot_token, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_unban_user(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM banned_users WHERE bot_token = ? AND user_id = ?", (bot_token, user_id))
     conn.commit()
     conn.close()
 
@@ -423,9 +461,9 @@ def db_remove_chat_admin(bot_token, user_id):
     conn.close()
 
 
-def db_save_requisites(bot_token, text):
+def db_save_requisites(bot_token, text, photo_id=None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO requisites VALUES (?, ?)", (bot_token, text))
+    conn.execute("INSERT OR REPLACE INTO requisites VALUES (?, ?, ?)", (bot_token, text, photo_id))
     conn.commit()
     conn.close()
 
@@ -467,9 +505,15 @@ def db_load_all():
             bot_chat_admins[bot_token] = set()
         bot_chat_admins[bot_token].add(user_id)
 
-    reqs_list = c.execute("SELECT bot_token, text FROM requisites").fetchall()
-    for bot_token, text in reqs_list:
-        bot_requisites[bot_token] = text
+    reqs_list = c.execute("SELECT bot_token, text, photo_id FROM requisites").fetchall()
+    for bot_token, text, photo_id in reqs_list:
+        bot_requisites[bot_token] = {"text": text, "photo_id": photo_id}
+
+    banned_list = c.execute("SELECT bot_token, user_id FROM banned_users").fetchall()
+    for bot_token, user_id in banned_list:
+        if bot_token not in banned_users:
+            banned_users[bot_token] = set()
+        banned_users[bot_token].add(user_id)
 
     conn.close()
     return bots_list
@@ -482,6 +526,7 @@ def setup_secret_bot_handlers(app):
     app.add_handler(CommandHandler("setshift", setshift_command))
     app.add_handler(CommandHandler("op", op_command))
     app.add_handler(CommandHandler("deop", deop_command))
+    app.add_handler(CommandHandler("kick", kick_command))
     app.add_handler(CommandHandler("chrq", chrq_command))
     app.add_handler(MessageHandler(filters.PHOTO, secret_chat_photo))
     app.add_handler(CallbackQueryHandler(debug_callback_handler), group=0)
@@ -653,6 +698,10 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
 
+    if user_id in banned_users.get(bot_token, set()):
+        await update.message.reply_text("❌ Вы заблокированы в этом чате")
+        return
+
     if context.args:
         invite_code = context.args[0]
 
@@ -703,20 +752,12 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pseudonym = user_pseudonyms[bot_token][user_id]
 
         is_admin = is_chat_admin(bot_token, user_id)
-        admin_text = ("\n\nКоманды админа:\n"
-            "/invite [минуты] - Ссылка-приглашение\n"
-            "/setshift - Настроить смену\n"
-            "/chrq - Изменить реквизиты\n"
-            "/op <id> - Назначить админа\n"
-            "/deop <id> - Снять админа") if is_admin else ""
 
         await update.message.reply_text(
             f"👋 С возвращением!\n\n"
             f"Ваш псевдоним: {pseudonym}\n\n"
-            f"Отправьте фото — оно будет определено как чек\n"
-            f"/change_name <новое_имя> - Сменить псевдоним"
-            f"{admin_text}",
-            reply_markup=get_main_keyboard()
+            f"Отправьте фото — оно будет определено как чек",
+            reply_markup=get_main_keyboard(is_admin)
         )
     else:
         is_admin = is_chat_admin(bot_token, user_id)
@@ -729,13 +770,7 @@ async def secret_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "👋 Добро пожаловать в секретный чат!\n\n"
                 "Вы являетесь администратором этого чата.\n\n"
-                "Выберите свой псевдоним — отправьте любое имя\n\n"
-                "Команды:\n"
-                "/invite [минуты] - Ссылка-приглашение\n"
-                "/setshift - Настроить смену\n"
-                "/chrq - Изменить реквизиты\n"
-                "/op <id> - Назначить админа\n"
-                "/deop <id> - Снять админа"
+                "Выберите свой псевдоним — отправьте любое имя"
             )
 
 
@@ -757,6 +792,10 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     bot_token = context.application.bot.token
     text = update.message.text
 
+    if user_id in banned_users.get(bot_token, set()):
+        await update.message.reply_text("❌ Вы заблокированы в этом чате")
+        return
+
     if bot_token not in user_pseudonyms:
         user_pseudonyms[bot_token] = {}
 
@@ -765,41 +804,178 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         db_add_pseudonym(bot_token, user_id, text)
 
         is_admin = is_chat_admin(bot_token, user_id)
-        admin_text = "\n/invite [минуты] - Сгенерировать ссылку-приглашение" if is_admin else ""
 
         await update.message.reply_text(
             f"✅ Ваш псевдоним установлен: {text}\n\n"
-            f"Теперь вы можете отправлять сообщения в секретный чат!\n\n"
-            f"Отправьте фото — оно будет определено как чек\n"
-            f"/change_name <новое_имя> - Сменить псевдоним"
-            f"{admin_text}",
-            reply_markup=get_main_keyboard()
+            f"Теперь вы можете отправлять сообщения в секретный чат!",
+            reply_markup=get_main_keyboard(is_admin)
         )
         return
 
-    if text == "Отправить фото":
+    is_admin = is_chat_admin(bot_token, user_id)
+
+    if text == "📷 Отправить фото":
         set_user_state(bot_token, user_id, {"mode": "send_photo"})
         await update.message.reply_text(
             "📷 Отправьте фото, и оно будет переслано как обычное фото (не чек).",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(is_admin)
         )
         return
 
-    if text == "Реквизиты":
+    if text == "📋 Реквизиты":
         reqs = bot_requisites.get(bot_token)
         if reqs:
-            await update.message.reply_text(f"📋 Актуальные реквизиты:\n\n{reqs}")
+            if reqs.get("photo_id"):
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=reqs["photo_id"],
+                    caption=f"📋 Актуальные реквизиты:\n\n{reqs.get('text', '')}"
+                )
+            else:
+                await update.message.reply_text(f"📋 Актуальные реквизиты:\n\n{reqs.get('text', '')}")
         else:
             await update.message.reply_text("📋 Реквизиты ещё не установлены")
         return
 
+    if text == "✏️ Сменить ник":
+        set_user_state(bot_token, user_id, {"mode": "waiting_new_name"})
+        await update.message.reply_text("Введите новый никнейм:")
+        return
+
+    if text == "🔗 Инвайт" and is_admin:
+        set_user_state(bot_token, user_id, {"mode": "waiting_invite_minutes"})
+        await update.message.reply_text("Введите время действия ссылки в минутах (или 0 для бессрочной):")
+        return
+
+    if text == "⏰ Смена" and is_admin:
+        set_user_state(bot_token, user_id, {"mode": "setshift_start"})
+        await update.message.reply_text("Введите час начала смены (0-23, МСК):")
+        return
+
+    if text == "📝 Изм. реквизиты" and is_admin:
+        set_user_state(bot_token, user_id, {"mode": "waiting_requisites"})
+        await update.message.reply_text("📋 Отправьте новые реквизиты (текст или фото с подписью):")
+        return
+
+    if text == "👑 Назначить админа" and is_admin:
+        set_user_state(bot_token, user_id, {"mode": "waiting_op_id"})
+        await update.message.reply_text("Введите ID пользователя для назначения админом:")
+        return
+
+    if text == "🚫 Снять админа" and is_admin:
+        set_user_state(bot_token, user_id, {"mode": "waiting_deop_id"})
+        await update.message.reply_text("Введите ID пользователя для снятия прав админа:")
+        return
+
+    if text == "👢 Кикнуть" and is_admin:
+        set_user_state(bot_token, user_id, {"mode": "waiting_kick_id"})
+        await update.message.reply_text("Введите ID пользователя для исключения:")
+        return
+
     state = get_user_state(bot_token, user_id)
 
-    if state and state.get("mode") == "waiting_requisites":
-        bot_requisites[bot_token] = text
-        db_save_requisites(bot_token, text)
+    if state and state.get("mode") == "waiting_new_name":
+        old_pseudonym = user_pseudonyms[bot_token][user_id]
+        user_pseudonyms[bot_token][user_id] = text
+        db_update_pseudonym(bot_token, user_id, text)
         set_user_state(bot_token, user_id, None)
-        await update.message.reply_text("✅ Реквизиты обновлены!")
+        await update.message.reply_text(f"✅ Никнейм изменён: {old_pseudonym} → {text}", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    if state and state.get("mode") == "waiting_invite_minutes":
+        try:
+            minutes = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ Введите число!")
+            return
+        set_user_state(bot_token, user_id, None)
+        code = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+        if minutes > 0:
+            expires_at = time.time() + (minutes * 60)
+        else:
+            expires_at = time.time() + (365 * 24 * 60 * 60)
+        invite_links[code] = {"bot_token": bot_token, "expires_at": expires_at, "used": False}
+        db_add_invite(code, bot_token, expires_at, False)
+        bot_username = context.bot.username
+        link = f"https://t.me/{bot_username}?start={code}"
+        await update.message.reply_text(f"🔗 Ссылка-приглашение:\n{link}", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    if state and state.get("mode") == "waiting_op_id":
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом")
+            return
+        set_user_state(bot_token, user_id, None)
+        if target_id not in user_pseudonyms.get(bot_token, {}):
+            await update.message.reply_text("❌ Пользователь не найден в этом чате", reply_markup=get_main_keyboard(is_admin))
+            return
+        if is_chat_admin(bot_token, target_id):
+            await update.message.reply_text("ℹ️ Этот пользователь уже является админом", reply_markup=get_main_keyboard(is_admin))
+            return
+        if bot_token not in bot_chat_admins:
+            bot_chat_admins[bot_token] = set()
+        bot_chat_admins[bot_token].add(target_id)
+        db_add_chat_admin(bot_token, target_id)
+        target_name = user_pseudonyms[bot_token].get(target_id, str(target_id))
+        await update.message.reply_text(f"✅ {target_name} назначен админом", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    if state and state.get("mode") == "waiting_deop_id":
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом")
+            return
+        set_user_state(bot_token, user_id, None)
+        if bot_token in bot_admins and bot_admins[bot_token] == target_id:
+            await update.message.reply_text("❌ Нельзя снять права создателя чата", reply_markup=get_main_keyboard(is_admin))
+            return
+        if target_id not in bot_chat_admins.get(bot_token, set()):
+            await update.message.reply_text("ℹ️ Этот пользователь не является админом", reply_markup=get_main_keyboard(is_admin))
+            return
+        bot_chat_admins[bot_token].discard(target_id)
+        db_remove_chat_admin(bot_token, target_id)
+        target_name = user_pseudonyms.get(bot_token, {}).get(target_id, str(target_id))
+        await update.message.reply_text(f"✅ {target_name} больше не админ", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    if state and state.get("mode") == "waiting_kick_id":
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом")
+            return
+        set_user_state(bot_token, user_id, None)
+        if bot_token in bot_admins and bot_admins[bot_token] == target_id:
+            await update.message.reply_text("❌ Нельзя кикнуть создателя чата", reply_markup=get_main_keyboard(is_admin))
+            return
+        if target_id not in user_pseudonyms.get(bot_token, {}):
+            await update.message.reply_text("❌ Пользователь не найден в этом чате", reply_markup=get_main_keyboard(is_admin))
+            return
+        target_name = user_pseudonyms[bot_token].get(target_id, str(target_id))
+        del user_pseudonyms[bot_token][target_id]
+        db_remove_pseudonym(bot_token, target_id)
+        if target_id in bot_chat_admins.get(bot_token, set()):
+            bot_chat_admins[bot_token].discard(target_id)
+            db_remove_chat_admin(bot_token, target_id)
+        if bot_token not in banned_users:
+            banned_users[bot_token] = set()
+        banned_users[bot_token].add(target_id)
+        db_ban_user(bot_token, target_id)
+        try:
+            await context.bot.send_message(chat_id=target_id, text="❌ Вы были исключены из этого чата")
+        except Exception:
+            pass
+        await update.message.reply_text(f"✅ {target_name} был исключён и заблокирован", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    if state and state.get("mode") == "waiting_requisites":
+        bot_requisites[bot_token] = {"text": text, "photo_id": None}
+        db_save_requisites(bot_token, text, None)
+        set_user_state(bot_token, user_id, None)
+        await update.message.reply_text("✅ Реквизиты обновлены!", reply_markup=get_main_keyboard(is_admin))
         for uid in user_pseudonyms[bot_token].keys():
             if uid != user_id:
                 try:
@@ -962,6 +1138,55 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     pseudonym = user_pseudonyms[bot_token][user_id]
 
+    if update.message.reply_to_message and text.lower() in ("удалить", "/удалить", "/delete", "delete"):
+        reply_msg_id = update.message.reply_to_message.message_id
+        original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
+        if original:
+            if original.get("sender_id") == user_id or is_chat_admin(bot_token, user_id):
+                deleted_count = 0
+                if "sent_to" in original:
+                    for uid, msg_id in original["sent_to"].items():
+                        try:
+                            await context.bot.delete_message(chat_id=uid, message_id=msg_id)
+                            deleted_count += 1
+                        except Exception as e:
+                            logger.error(f"Error deleting message for {uid}: {e}")
+                    try:
+                        await context.bot.delete_message(chat_id=user_id, message_id=reply_msg_id)
+                        deleted_count += 1
+                    except Exception:
+                        pass
+                elif "sender_msg_id" in original:
+                    sender_id = original["sender_id"]
+                    sender_msg_id = original["sender_msg_id"]
+                    sender_original = message_map.get(bot_token, {}).get((sender_id, sender_msg_id))
+                    if sender_original and "sent_to" in sender_original:
+                        for uid, msg_id in sender_original["sent_to"].items():
+                            try:
+                                await context.bot.delete_message(chat_id=uid, message_id=msg_id)
+                                deleted_count += 1
+                            except Exception as e:
+                                logger.error(f"Error deleting message for {uid}: {e}")
+                        try:
+                            await context.bot.delete_message(chat_id=sender_id, message_id=sender_msg_id)
+                            deleted_count += 1
+                        except Exception:
+                            pass
+                try:
+                    await context.bot.delete_message(chat_id=user_id, message_id=update.message.message_id)
+                except Exception:
+                    pass
+                if deleted_count > 0:
+                    await update.message.reply_text(f"✅ Сообщение удалено у {deleted_count} участников")
+                else:
+                    await update.message.reply_text("❌ Не удалось удалить сообщение")
+            else:
+                await update.message.reply_text("❌ Вы можете удалять только свои сообщения")
+            return
+        else:
+            await update.message.reply_text("❌ Сообщение не найдено или слишком старое")
+            return
+
     reply_prefix = ""
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
@@ -976,18 +1201,25 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if bot_token not in message_map:
         message_map[bot_token] = {}
-    message_map[bot_token][(user_id, update.message.message_id)] = {
+
+    sender_key = (user_id, update.message.message_id)
+    message_map[bot_token][sender_key] = {
         "pseudonym": pseudonym,
-        "text": text
+        "text": text,
+        "sender_id": user_id,
+        "sent_to": {}
     }
 
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
                 sent = await context.bot.send_message(chat_id=uid, text=message_text)
+                message_map[bot_token][sender_key]["sent_to"][uid] = sent.message_id
                 message_map[bot_token][(uid, sent.message_id)] = {
                     "pseudonym": pseudonym,
-                    "text": text
+                    "text": text,
+                    "sender_id": user_id,
+                    "sender_msg_id": update.message.message_id
                 }
             except Exception as e:
                 logger.error(f"Error sending to {uid}: {e}")
@@ -996,6 +1228,10 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
+
+    if user_id in banned_users.get(bot_token, set()):
+        await update.message.reply_text("❌ Вы заблокированы в этом чате")
+        return
 
     if bot_token not in user_pseudonyms:
         user_pseudonyms[bot_token] = {}
@@ -1006,6 +1242,22 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pseudonym = user_pseudonyms[bot_token][user_id]
     state = get_user_state(bot_token, user_id)
+    is_admin = is_chat_admin(bot_token, user_id)
+
+    if state and state.get("mode") == "waiting_requisites":
+        photo_id = update.message.photo[-1].file_id
+        caption = update.message.caption or ""
+        bot_requisites[bot_token] = {"text": caption, "photo_id": photo_id}
+        db_save_requisites(bot_token, caption, photo_id)
+        set_user_state(bot_token, user_id, None)
+        await update.message.reply_text("✅ Реквизиты с фото обновлены!", reply_markup=get_main_keyboard(is_admin))
+        for uid in user_pseudonyms[bot_token].keys():
+            if uid != user_id:
+                try:
+                    await context.bot.send_message(chat_id=uid, text="📋 Реквизиты были обновлены")
+                except Exception:
+                    pass
+        return
 
     if state and state.get("mode") == "send_photo":
         set_user_state(bot_token, user_id, None)
@@ -1016,7 +1268,7 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_photo(chat_id=uid, photo=update.message.photo[-1].file_id)
                 except Exception as e:
                     logger.error(f"Error sending photo to {uid}: {e}")
-        await update.message.reply_text("✅ Фото отправлено.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("✅ Фото отправлено.", reply_markup=get_main_keyboard(is_admin))
         return
 
     photo_id = update.message.photo[-1].file_id
@@ -1027,6 +1279,10 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
+
+    if user_id in banned_users.get(bot_token, set()):
+        await update.message.reply_text("❌ Вы заблокированы в этом чате")
+        return
 
     if bot_token not in user_pseudonyms:
         user_pseudonyms[bot_token] = {}
@@ -1341,6 +1597,54 @@ async def deop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ {target_name} больше не админ")
 
 
+async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_token = context.application.bot.token
+
+    if not is_chat_admin(bot_token, user_id):
+        await update.message.reply_text("❌ Только админы могут использовать эту команду")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /kick <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+
+    if bot_token in bot_admins and bot_admins[bot_token] == target_id:
+        await update.message.reply_text("❌ Нельзя кикнуть создателя чата")
+        return
+
+    if target_id not in user_pseudonyms.get(bot_token, {}):
+        await update.message.reply_text("❌ Пользователь не найден в этом чате")
+        return
+
+    target_name = user_pseudonyms[bot_token].get(target_id, str(target_id))
+
+    del user_pseudonyms[bot_token][target_id]
+    db_remove_pseudonym(bot_token, target_id)
+
+    if target_id in bot_chat_admins.get(bot_token, set()):
+        bot_chat_admins[bot_token].discard(target_id)
+        db_remove_chat_admin(bot_token, target_id)
+
+    if bot_token not in banned_users:
+        banned_users[bot_token] = set()
+    banned_users[bot_token].add(target_id)
+    db_ban_user(bot_token, target_id)
+
+    try:
+        await context.bot.send_message(chat_id=target_id, text="❌ Вы были исключены из этого чата")
+    except Exception:
+        pass
+
+    await update.message.reply_text(f"✅ {target_name} был исключён и заблокирован")
+
+
 async def chrq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bot_token = context.application.bot.token
@@ -1428,10 +1732,11 @@ async def handle_setshift_flow(update, context, bot_token, user_id, state, text)
             desc = f"с {start}:00 до {hour}:00 МСК"
         else:
             desc = f"с {start}:00 до {hour}:00 МСК (через полночь)"
+        is_admin = is_chat_admin(bot_token, user_id)
         await update.message.reply_text(
             f"✅ Смена установлена: {desc}\n\n"
             f"Чеки будут учитываться только в рабочее время.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(is_admin)
         )
         return True
 
