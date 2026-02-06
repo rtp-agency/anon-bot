@@ -1004,7 +1004,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             new_amount = float(clean_text)
         except ValueError:
-            await update.message.reply_text("❌ Введите только цифры!")
+            await update.message.reply_text("❌ Неверный формат! Введите число (например 100 или 100.50)")
             return
 
         receipt_id = state.get("receipt_id")
@@ -1084,7 +1084,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             amount = float(clean_text)
         except ValueError:
-            await update.message.reply_text("❌ Введите только цифры!")
+            await update.message.reply_text("❌ Неверный формат! Введите число (например 100 или 100.50)")
             return
 
         currency = get_bot_currency(bot_token)
@@ -1118,6 +1118,9 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         receipts[receipt_id] = receipt_data
 
+        if bot_token not in message_map:
+            message_map[bot_token] = {}
+
         for uid in user_pseudonyms[bot_token].keys():
             try:
                 caption = f"{pseudonym}: {receipt_text}\n\nНовый чек\nСтатус: Ожидание"
@@ -1140,6 +1143,11 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if "message_ids" not in receipts[receipt_id]:
                     receipts[receipt_id]["message_ids"] = {}
                 receipts[receipt_id]["message_ids"][uid] = sent.message_id
+                message_map[bot_token][(uid, sent.message_id)] = {
+                    "pseudonym": pseudonym,
+                    "text": f"Чек: {receipt_text}",
+                    "sender_id": user_id
+                }
             except Exception as e:
                 logger.error(f"Error sending receipt to {uid}: {e}")
 
@@ -1272,11 +1280,26 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state and state.get("mode") == "send_photo":
         set_user_state(bot_token, user_id, None)
+        if bot_token not in message_map:
+            message_map[bot_token] = {}
+        message_map[bot_token][(user_id, update.message.message_id)] = {
+            "pseudonym": pseudonym,
+            "text": "[Фото]",
+            "sender_id": user_id,
+            "sent_to": {}
+        }
         for uid in user_pseudonyms[bot_token].keys():
             if uid != user_id:
                 try:
-                    await context.bot.send_message(chat_id=uid, text=f"{pseudonym}:")
+                    label = await context.bot.send_message(chat_id=uid, text=f"{pseudonym}:")
                     await context.bot.send_photo(chat_id=uid, photo=update.message.photo[-1].file_id)
+                    message_map[bot_token][(user_id, update.message.message_id)]["sent_to"][uid] = label.message_id
+                    message_map[bot_token][(uid, label.message_id)] = {
+                        "pseudonym": pseudonym,
+                        "text": "[Фото]",
+                        "sender_id": user_id,
+                        "sender_msg_id": update.message.message_id
+                    }
                 except Exception as e:
                     logger.error(f"Error sending photo to {uid}: {e}")
         await update.message.reply_text("✅ Фото отправлено.", reply_markup=get_main_keyboard(is_admin))
@@ -1284,7 +1307,7 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     photo_id = update.message.photo[-1].file_id
     set_user_state(bot_token, user_id, {"mode": "waiting_amount", "photo_id": photo_id})
-    await update.message.reply_text("Введите сумму чека (только цифры):")
+    await update.message.reply_text("Введите сумму чека (например 100 или 100.50):")
 
 
 async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1307,13 +1330,34 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.document and update.message.document.mime_type == "application/pdf":
         doc_id = update.message.document.file_id
         set_user_state(bot_token, user_id, {"mode": "waiting_amount", "document_id": doc_id})
-        await update.message.reply_text("Введите сумму чека (только цифры):")
+        await update.message.reply_text("Введите сумму чека (например 100 или 100.50):")
         return
+
+    media_label = "[Медиа]"
+    if update.message.video:
+        media_label = "[Видео]"
+    elif update.message.video_note:
+        media_label = "[Видеосообщение]"
+    elif update.message.voice:
+        media_label = "[Голосовое]"
+    elif update.message.audio:
+        media_label = "[Аудио]"
+    elif update.message.document:
+        media_label = "[Файл]"
+
+    if bot_token not in message_map:
+        message_map[bot_token] = {}
+    message_map[bot_token][(user_id, update.message.message_id)] = {
+        "pseudonym": pseudonym,
+        "text": media_label,
+        "sender_id": user_id,
+        "sent_to": {}
+    }
 
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
-                await context.bot.send_message(chat_id=uid, text=f"{pseudonym}:")
+                label = await context.bot.send_message(chat_id=uid, text=f"{pseudonym}:")
 
                 if update.message.video:
                     await context.bot.send_video(chat_id=uid, video=update.message.video.file_id)
@@ -1325,6 +1369,14 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_audio(chat_id=uid, audio=update.message.audio.file_id)
                 elif update.message.document:
                     await context.bot.send_document(chat_id=uid, document=update.message.document.file_id)
+
+                message_map[bot_token][(user_id, update.message.message_id)]["sent_to"][uid] = label.message_id
+                message_map[bot_token][(uid, label.message_id)] = {
+                    "pseudonym": pseudonym,
+                    "text": media_label,
+                    "sender_id": user_id,
+                    "sender_msg_id": update.message.message_id
+                }
             except Exception as e:
                 logger.error(f"Error sending media to {uid}: {e}")
 
@@ -1368,15 +1420,17 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     approver_id = query.from_user.id
     approver_name = user_pseudonyms.get(bot_token, {}).get(approver_id, "Неизвестный")
 
+    prev_status = receipt_data.get("status")
+
     if action == "approve":
-        if receipt_data.get("status") == "approved":
+        if prev_status == "approved":
             await query.answer("Этот чек уже принят", show_alert=True)
             return
         receipt_data["status"] = "approved"
         status_text = f"Статус: Принят ✅ ({approver_name})"
         await query.answer("Чек принят!")
     elif action == "decline":
-        if receipt_data.get("status") == "declined":
+        if prev_status == "declined":
             await query.answer("Этот чек уже отклонён", show_alert=True)
             return
         receipt_data["status"] = "declined"
@@ -1410,16 +1464,15 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         bot_to_use = bot_app.bot
 
+    bot_username = bot_to_use.username if hasattr(bot_to_use, 'username') else "unknown"
+    amount = receipt_data.get("amount")
+    currency = receipt_data.get("currency")
+
     if action == "approve":
-        bot_username = bot_to_use.username if hasattr(bot_to_use, 'username') else "unknown"
-        photo_url = None
-        if "photo_id" in receipt_data:
-            photo_url = f"https://t.me/c/{receipt_data['photo_id']}"
-
-        amount = receipt_data.get("amount")
-        currency = receipt_data.get("currency")
-
         if amount:
+            photo_url = None
+            if "photo_id" in receipt_data:
+                photo_url = f"https://t.me/c/{receipt_data['photo_id']}"
             add_receipt_to_sheet(
                 bot_username=bot_username,
                 amount=amount,
@@ -1431,11 +1484,18 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_add_daily_total(bot_token, amount)
             logger.info(f"Added receipt to Google Sheets: {amount} {currency}")
 
-    elif action == "cancel":
-        bot_username = bot_to_use.username if hasattr(bot_to_use, 'username') else "unknown"
-        amount = receipt_data.get("amount")
-        currency = receipt_data.get("currency")
+    elif action == "decline":
+        if prev_status == "approved" and amount:
+            remove_receipt_from_sheet(
+                bot_username=bot_username,
+                amount=amount,
+                pseudonym=receipt_data["pseudonym"]
+            )
+            if is_working_hours(bot_token):
+                db_subtract_daily_total(bot_token, amount)
+            logger.info(f"Declined previously approved receipt: {amount} {currency}")
 
+    elif action == "cancel":
         if amount:
             remove_receipt_from_sheet(
                 bot_username=bot_username,
