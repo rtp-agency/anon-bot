@@ -1146,7 +1146,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 message_map[bot_token][(uid, sent.message_id)] = {
                     "pseudonym": pseudonym,
                     "text": f"Чек: {receipt_text}",
-                    "sender_id": user_id
+                    "sender_id": user_id,
+                    "receipt_id": receipt_id
                 }
             except Exception as e:
                 logger.error(f"Error sending receipt to {uid}: {e}")
@@ -1207,14 +1208,23 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     reply_prefix = ""
+    reply_receipt_data = None
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
         original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
         if original:
-            orig_text = original["text"]
-            if len(orig_text) > 50:
-                orig_text = orig_text[:50] + "..."
-            reply_prefix = f"┌ {original['pseudonym']}: {orig_text}\n└ "
+            rid = original.get("receipt_id")
+            if rid and rid in receipts:
+                r = receipts[rid]
+                status_map = {"pending": "⏳", "approved": "✅", "declined": "❌"}
+                s_icon = status_map.get(r.get("status"), "")
+                reply_prefix = f"┌ {s_icon} Чек {original['pseudonym']}: {r.get('text', '?')}\n└ "
+                reply_receipt_data = r
+            else:
+                orig_text = original["text"]
+                if len(orig_text) > 50:
+                    orig_text = orig_text[:50] + "..."
+                reply_prefix = f"┌ {original['pseudonym']}: {orig_text}\n└ "
 
     message_text = f"{reply_prefix}{pseudonym}: {text}"
 
@@ -1232,6 +1242,17 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
+                if reply_receipt_data and "message_ids" in reply_receipt_data:
+                    receipt_msg_id = reply_receipt_data["message_ids"].get(uid)
+                    if receipt_msg_id:
+                        try:
+                            await context.bot.forward_message(
+                                chat_id=uid,
+                                from_chat_id=uid,
+                                message_id=receipt_msg_id
+                            )
+                        except Exception:
+                            pass
                 sent = await context.bot.send_message(chat_id=uid, text=message_text)
                 message_map[bot_token][sender_key]["sent_to"][uid] = sent.message_id
                 message_map[bot_token][(uid, sent.message_id)] = {
@@ -1551,6 +1572,27 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception as e:
                 logger.error(f"Error updating receipt for {uid}: {e}", exc_info=True)
+
+    now_msk = get_moscow_now().strftime("%H:%M МСК")
+    receipt_owner = receipt_data.get("pseudonym", "Неизвестный")
+    amount_str = format_amount(amount) if amount else "?"
+    currency_str = currency or currency_for_total
+
+    if action == "approve":
+        notify_text = f"🔔 {approver_name} принял чек {receipt_owner}: {amount_str} {currency_str} ({now_msk})"
+    elif action == "decline":
+        notify_text = f"🔔 {approver_name} отклонил чек {receipt_owner}: {amount_str} {currency_str} ({now_msk})"
+    elif action == "undo":
+        notify_text = f"🔔 {approver_name} вернул чек {receipt_owner}: {amount_str} {currency_str} на рассмотрение ({now_msk})"
+    else:
+        notify_text = None
+
+    if notify_text:
+        for uid in user_pseudonyms.get(bot_token, {}).keys():
+            try:
+                await bot_to_use.send_message(chat_id=uid, text=notify_text)
+            except Exception as e:
+                logger.error(f"Error sending receipt notification to {uid}: {e}")
 
     logger.info("=== Receipt callback finished ===")
 
