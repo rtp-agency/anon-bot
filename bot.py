@@ -48,6 +48,7 @@ user_states = {}
 bot_requisites = {}
 message_map = {}
 banned_users = {}
+receipt_watchers = {}
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
@@ -124,6 +125,7 @@ def get_main_keyboard(is_admin=False):
     if is_admin:
         keyboard.append(["🔗 Инвайт", "⏰ Смена", "📝 Изм. реквизиты"])
         keyboard.append(["👑 Назначить админа", "🚫 Снять админа", "👢 Кикнуть"])
+        keyboard.append(["🔔 Уведомления чеков", "📋 Лист участников"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -355,6 +357,11 @@ def init_db():
         user_id INTEGER,
         PRIMARY KEY (bot_token, user_id)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS receipt_watchers (
+        bot_token TEXT,
+        user_id INTEGER,
+        PRIMARY KEY (bot_token, user_id)
+    )""")
     conn.commit()
     conn.close()
 
@@ -390,6 +397,20 @@ def db_ban_user(bot_token, user_id):
 def db_unban_user(bot_token, user_id):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM banned_users WHERE bot_token = ? AND user_id = ?", (bot_token, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_add_receipt_watcher(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR IGNORE INTO receipt_watchers VALUES (?, ?)", (bot_token, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_remove_receipt_watcher(bot_token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM receipt_watchers WHERE bot_token = ? AND user_id = ?", (bot_token, user_id))
     conn.commit()
     conn.close()
 
@@ -514,6 +535,12 @@ def db_load_all():
         if bot_token not in banned_users:
             banned_users[bot_token] = set()
         banned_users[bot_token].add(user_id)
+
+    watchers_list = c.execute("SELECT bot_token, user_id FROM receipt_watchers").fetchall()
+    for bot_token, user_id in watchers_list:
+        if bot_token not in receipt_watchers:
+            receipt_watchers[bot_token] = set()
+        receipt_watchers[bot_token].add(user_id)
 
     conn.close()
     return bots_list
@@ -883,6 +910,38 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Введите ID пользователя для исключения:")
         return
 
+    if text == "🔔 Уведомления чеков" and is_admin:
+        watchers = receipt_watchers.get(bot_token, set())
+        watcher_names = []
+        for wid in watchers:
+            name = user_pseudonyms.get(bot_token, {}).get(wid, str(wid))
+            watcher_names.append(f"  • {name} (ID: {wid})")
+        watcher_list = "\n".join(watcher_names) if watcher_names else "  Пока никого"
+        set_user_state(bot_token, user_id, {"mode": "waiting_watcher_action"})
+        await update.message.reply_text(
+            f"🔔 Уведомления о чеках\n\n"
+            f"Уведомления получают:\n"
+            f"  • Автор чека (всегда)\n"
+            f"{watcher_list}\n\n"
+            f"Отправьте ID пользователя чтобы добавить/убрать из списка,\n"
+            f"или напишите «отмена» для выхода.",
+            reply_markup=get_main_keyboard(is_admin)
+        )
+        return
+
+    if text == "📋 Лист участников" and is_admin:
+        users = user_pseudonyms.get(bot_token, {})
+        if not users:
+            await update.message.reply_text("📋 Участников пока нет", reply_markup=get_main_keyboard(is_admin))
+            return
+        lines = ["📋 Участники чата:\n"]
+        for uid, pseudonym_name in users.items():
+            admin_mark = " 👑" if is_chat_admin(bot_token, uid) else ""
+            lines.append(f"  • {pseudonym_name} (ID: {uid}){admin_mark}")
+        lines.append(f"\nВсего: {len(users)}")
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_keyboard(is_admin))
+        return
+
     state = get_user_state(bot_token, user_id)
 
     if state and state.get("mode") == "waiting_new_name":
@@ -980,6 +1039,34 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
         await update.message.reply_text(f"✅ {target_name} был исключён и заблокирован", reply_markup=get_main_keyboard(is_admin))
+        return
+
+    if state and state.get("mode") == "waiting_watcher_action":
+        if text.lower() in ("отмена", "cancel"):
+            set_user_state(bot_token, user_id, None)
+            await update.message.reply_text("✅ Готово", reply_markup=get_main_keyboard(is_admin))
+            return
+        try:
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ Введите ID (число) или «отмена»")
+            return
+        if target_id not in user_pseudonyms.get(bot_token, {}):
+            await update.message.reply_text("❌ Пользователь не найден в этом чате", reply_markup=get_main_keyboard(is_admin))
+            set_user_state(bot_token, user_id, None)
+            return
+        target_name = user_pseudonyms[bot_token].get(target_id, str(target_id))
+        if bot_token not in receipt_watchers:
+            receipt_watchers[bot_token] = set()
+        if target_id in receipt_watchers[bot_token]:
+            receipt_watchers[bot_token].discard(target_id)
+            db_remove_receipt_watcher(bot_token, target_id)
+            await update.message.reply_text(f"🔕 {target_name} убран из уведомлений о чеках", reply_markup=get_main_keyboard(is_admin))
+        else:
+            receipt_watchers[bot_token].add(target_id)
+            db_add_receipt_watcher(bot_token, target_id)
+            await update.message.reply_text(f"🔔 {target_name} добавлен в уведомления о чеках", reply_markup=get_main_keyboard(is_admin))
+        set_user_state(bot_token, user_id, None)
         return
 
     if state and state.get("mode") == "waiting_requisites":
@@ -1110,6 +1197,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "bot_token": bot_token,
             "amount": amount,
             "currency": currency,
+            "owner_id": user_id,
         }
         if photo_id:
             receipt_data["photo_id"] = photo_id
@@ -1441,6 +1529,10 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     approver_id = query.from_user.id
     approver_name = user_pseudonyms.get(bot_token, {}).get(approver_id, "Неизвестный")
 
+    if action in ("approve", "decline", "undo") and not is_chat_admin(bot_token, approver_id):
+        await query.answer("❌ Только админы могут управлять чеками", show_alert=True)
+        return
+
     prev_status = receipt_data.get("status")
 
     if action == "approve":
@@ -1574,21 +1666,26 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error updating receipt for {uid}: {e}", exc_info=True)
 
     now_msk = get_moscow_now().strftime("%H:%M МСК")
-    receipt_owner = receipt_data.get("pseudonym", "Неизвестный")
+    owner_id = receipt_data.get("owner_id")
     amount_str = format_amount(amount) if amount else "?"
     currency_str = currency or currency_for_total
 
     if action == "approve":
-        notify_text = f"🔔 {approver_name} принял чек {receipt_owner}: {amount_str} {currency_str} ({now_msk})"
+        notify_text = f"✅ Ваш чек на {amount_str} {currency_str} принят ({approver_name}, {now_msk})"
     elif action == "decline":
-        notify_text = f"🔔 {approver_name} отклонил чек {receipt_owner}: {amount_str} {currency_str} ({now_msk})"
+        notify_text = f"❌ Ваш чек на {amount_str} {currency_str} отклонён ({approver_name}, {now_msk})"
     elif action == "undo":
-        notify_text = f"🔔 {approver_name} вернул чек {receipt_owner}: {amount_str} {currency_str} на рассмотрение ({now_msk})"
+        notify_text = f"🔄 Ваш чек на {amount_str} {currency_str} возвращён на рассмотрение ({approver_name}, {now_msk})"
     else:
         notify_text = None
 
     if notify_text:
-        for uid in user_pseudonyms.get(bot_token, {}).keys():
+        notify_ids = set()
+        if owner_id:
+            notify_ids.add(owner_id)
+        notify_ids.update(receipt_watchers.get(bot_token, set()))
+        notify_ids.discard(approver_id)
+        for uid in notify_ids:
             try:
                 await bot_to_use.send_message(chat_id=uid, text=notify_text)
             except Exception as e:
