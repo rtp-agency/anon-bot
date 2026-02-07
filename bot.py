@@ -1198,6 +1198,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "amount": amount,
             "currency": currency,
             "owner_id": user_id,
+            "created_at": get_moscow_now().strftime("%H:%M"),
         }
         if photo_id:
             receipt_data["photo_id"] = photo_id
@@ -1296,7 +1297,6 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     reply_prefix = ""
-    reply_receipt_data = None
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
         original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
@@ -1306,8 +1306,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 r = receipts[rid]
                 status_map = {"pending": "⏳", "approved": "✅", "declined": "❌"}
                 s_icon = status_map.get(r.get("status"), "")
-                reply_prefix = f"┌ {s_icon} Чек {original['pseudonym']}: {r.get('text', '?')}\n└ "
-                reply_receipt_data = r
+                created_time = r.get("created_at", "?")
+                reply_prefix = f"┌ {s_icon} Чек {original['pseudonym']} ({created_time} МСК): {r.get('text', '?')}\n└ "
             else:
                 orig_text = original["text"]
                 if len(orig_text) > 50:
@@ -1330,17 +1330,6 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
-                if reply_receipt_data and "message_ids" in reply_receipt_data:
-                    receipt_msg_id = reply_receipt_data["message_ids"].get(uid)
-                    if receipt_msg_id:
-                        try:
-                            await context.bot.forward_message(
-                                chat_id=uid,
-                                from_chat_id=uid,
-                                message_id=receipt_msg_id
-                            )
-                        except Exception:
-                            pass
                 sent = await context.bot.send_message(chat_id=uid, text=message_text)
                 message_map[bot_token][sender_key]["sent_to"][uid] = sent.message_id
                 message_map[bot_token][(uid, sent.message_id)] = {
