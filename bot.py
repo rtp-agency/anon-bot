@@ -937,9 +937,9 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines = ["📋 Участники чата:\n"]
         for uid, pseudonym_name in users.items():
             admin_mark = " 👑" if is_chat_admin(bot_token, uid) else ""
-            lines.append(f"  • {pseudonym_name} (ID: {uid}){admin_mark}")
+            lines.append(f"  • {pseudonym_name} | ID: <code>{uid}</code>{admin_mark}")
         lines.append(f"\nВсего: {len(users)}")
-        await update.message.reply_text("\n".join(lines), reply_markup=get_main_keyboard(is_admin))
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_keyboard(is_admin), parse_mode="HTML")
         return
 
     state = get_user_state(bot_token, user_id)
