@@ -1296,12 +1296,19 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Сообщение не найдено или слишком старое")
             return
 
-    reply_to_msg_id = None
+    root_entry = None
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
         original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
         if original:
-            reply_to_msg_id = original
+            if "sent_to" in original:
+                root_entry = original
+            elif "sender_msg_id" in original:
+                sender_entry = message_map.get(bot_token, {}).get(
+                    (original["sender_id"], original["sender_msg_id"])
+                )
+                if sender_entry:
+                    root_entry = sender_entry
 
     message_text = f"{pseudonym}: {text}"
 
@@ -1313,6 +1320,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         "pseudonym": pseudonym,
         "text": text,
         "sender_id": user_id,
+        "sender_msg_id": update.message.message_id,
         "sent_to": {}
     }
 
@@ -1320,11 +1328,11 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if uid != user_id:
             try:
                 target_reply_id = None
-                if reply_to_msg_id:
-                    if "sent_to" in reply_to_msg_id and uid in reply_to_msg_id["sent_to"]:
-                        target_reply_id = reply_to_msg_id["sent_to"][uid]
-                    elif "sender_id" in reply_to_msg_id and reply_to_msg_id["sender_id"] == uid:
-                        target_reply_id = reply_to_msg_id.get("sender_msg_id")
+                if root_entry:
+                    if uid in root_entry.get("sent_to", {}):
+                        target_reply_id = root_entry["sent_to"][uid]
+                    elif root_entry.get("sender_id") == uid:
+                        target_reply_id = root_entry.get("sender_msg_id")
 
                 sent = await context.bot.send_message(
                     chat_id=uid,
@@ -1381,28 +1389,36 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_token not in message_map:
             message_map[bot_token] = {}
 
-        reply_to_msg_id = None
+        root_entry = None
         if update.message.reply_to_message:
             reply_msg_id = update.message.reply_to_message.message_id
             original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
             if original:
-                reply_to_msg_id = original
+                if "sent_to" in original:
+                    root_entry = original
+                elif "sender_msg_id" in original:
+                    sender_entry = message_map.get(bot_token, {}).get(
+                        (original["sender_id"], original["sender_msg_id"])
+                    )
+                    if sender_entry:
+                        root_entry = sender_entry
 
         message_map[bot_token][(user_id, update.message.message_id)] = {
             "pseudonym": pseudonym,
             "text": "[Фото]",
             "sender_id": user_id,
+            "sender_msg_id": update.message.message_id,
             "sent_to": {}
         }
         for uid in user_pseudonyms[bot_token].keys():
             if uid != user_id:
                 try:
                     target_reply_id = None
-                    if reply_to_msg_id:
-                        if "sent_to" in reply_to_msg_id and uid in reply_to_msg_id["sent_to"]:
-                            target_reply_id = reply_to_msg_id["sent_to"][uid]
-                        elif "sender_id" in reply_to_msg_id and reply_to_msg_id["sender_id"] == uid:
-                            target_reply_id = reply_to_msg_id.get("sender_msg_id")
+                    if root_entry:
+                        if uid in root_entry.get("sent_to", {}):
+                            target_reply_id = root_entry["sent_to"][uid]
+                        elif root_entry.get("sender_id") == uid:
+                            target_reply_id = root_entry.get("sender_msg_id")
 
                     sent_photo = await context.bot.send_photo(
                         chat_id=uid,
@@ -1462,12 +1478,19 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.document:
         media_label = "[Файл]"
 
-    reply_to_msg_id = None
+    root_entry = None
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
         original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
         if original:
-            reply_to_msg_id = original
+            if "sent_to" in original:
+                root_entry = original
+            elif "sender_msg_id" in original:
+                sender_entry = message_map.get(bot_token, {}).get(
+                    (original["sender_id"], original["sender_msg_id"])
+                )
+                if sender_entry:
+                    root_entry = sender_entry
 
     if bot_token not in message_map:
         message_map[bot_token] = {}
@@ -1475,6 +1498,7 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pseudonym": pseudonym,
         "text": media_label,
         "sender_id": user_id,
+        "sender_msg_id": update.message.message_id,
         "sent_to": {}
     }
 
@@ -1482,11 +1506,11 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid != user_id:
             try:
                 target_reply_id = None
-                if reply_to_msg_id:
-                    if "sent_to" in reply_to_msg_id and uid in reply_to_msg_id["sent_to"]:
-                        target_reply_id = reply_to_msg_id["sent_to"][uid]
-                    elif "sender_id" in reply_to_msg_id and reply_to_msg_id["sender_id"] == uid:
-                        target_reply_id = reply_to_msg_id.get("sender_msg_id")
+                if root_entry:
+                    if uid in root_entry.get("sent_to", {}):
+                        target_reply_id = root_entry["sent_to"][uid]
+                    elif root_entry.get("sender_id") == uid:
+                        target_reply_id = root_entry.get("sender_msg_id")
 
                 sent_media = None
                 if update.message.video:
