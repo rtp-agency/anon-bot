@@ -59,6 +59,38 @@ spreadsheet = None
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
+def resolve_reply_target(bot_token, user_id, reply_msg_id, target_uid):
+    original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
+    if not original:
+        return None
+
+    if "receipt_id" in original:
+        receipt = receipts.get(original["receipt_id"])
+        if receipt and "message_ids" in receipt:
+            return receipt["message_ids"].get(target_uid)
+        return None
+
+    root_entry = None
+    if "sent_to" in original:
+        root_entry = original
+    elif "sender_msg_id" in original:
+        sender_entry = message_map.get(bot_token, {}).get(
+            (original["sender_id"], original["sender_msg_id"])
+        )
+        if sender_entry:
+            root_entry = sender_entry
+
+    if not root_entry:
+        return None
+
+    if target_uid in root_entry.get("sent_to", {}):
+        return root_entry["sent_to"][target_uid]
+    elif root_entry.get("sender_id") == target_uid:
+        return root_entry.get("sender_msg_id")
+
+    return None
+
+
 def format_amount(value):
     num = float(value)
     if num == int(num):
@@ -1177,6 +1209,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         currency = get_bot_currency(bot_token)
         photo_id = state.get("photo_id")
         document_id = state.get("document_id")
+        saved_reply_msg_id = state.get("reply_msg_id")
         pseudonym = user_pseudonyms[bot_token][user_id]
         receipt_text = f"{format_amount(amount)} {currency}"
 
@@ -1212,20 +1245,23 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         for uid in user_pseudonyms[bot_token].keys():
             try:
+                target_reply_id = resolve_reply_target(bot_token, user_id, saved_reply_msg_id, uid) if saved_reply_msg_id else None
                 caption = f"{pseudonym}: {receipt_text}\n\nНовый чек\nСтатус: Ожидание"
                 if photo_id:
                     sent = await context.bot.send_photo(
                         chat_id=uid,
                         photo=photo_id,
                         caption=caption,
-                        reply_markup=reply_markup
+                        reply_markup=reply_markup,
+                        reply_to_message_id=target_reply_id
                     )
                 elif document_id:
                     sent = await context.bot.send_document(
                         chat_id=uid,
                         document=document_id,
                         caption=caption,
-                        reply_markup=reply_markup
+                        reply_markup=reply_markup,
+                        reply_to_message_id=target_reply_id
                     )
                 else:
                     continue
@@ -1296,19 +1332,9 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Сообщение не найдено или слишком старое")
             return
 
-    root_entry = None
+    reply_msg_id = None
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
-        original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
-        if original:
-            if "sent_to" in original:
-                root_entry = original
-            elif "sender_msg_id" in original:
-                sender_entry = message_map.get(bot_token, {}).get(
-                    (original["sender_id"], original["sender_msg_id"])
-                )
-                if sender_entry:
-                    root_entry = sender_entry
 
     message_text = f"{pseudonym}: {text}"
 
@@ -1327,12 +1353,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
-                target_reply_id = None
-                if root_entry:
-                    if uid in root_entry.get("sent_to", {}):
-                        target_reply_id = root_entry["sent_to"][uid]
-                    elif root_entry.get("sender_id") == uid:
-                        target_reply_id = root_entry.get("sender_msg_id")
+                target_reply_id = resolve_reply_target(bot_token, user_id, reply_msg_id, uid) if reply_msg_id else None
 
                 sent = await context.bot.send_message(
                     chat_id=uid,
@@ -1389,19 +1410,9 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_token not in message_map:
             message_map[bot_token] = {}
 
-        root_entry = None
+        reply_msg_id = None
         if update.message.reply_to_message:
             reply_msg_id = update.message.reply_to_message.message_id
-            original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
-            if original:
-                if "sent_to" in original:
-                    root_entry = original
-                elif "sender_msg_id" in original:
-                    sender_entry = message_map.get(bot_token, {}).get(
-                        (original["sender_id"], original["sender_msg_id"])
-                    )
-                    if sender_entry:
-                        root_entry = sender_entry
 
         message_map[bot_token][(user_id, update.message.message_id)] = {
             "pseudonym": pseudonym,
@@ -1413,12 +1424,7 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for uid in user_pseudonyms[bot_token].keys():
             if uid != user_id:
                 try:
-                    target_reply_id = None
-                    if root_entry:
-                        if uid in root_entry.get("sent_to", {}):
-                            target_reply_id = root_entry["sent_to"][uid]
-                        elif root_entry.get("sender_id") == uid:
-                            target_reply_id = root_entry.get("sender_msg_id")
+                    target_reply_id = resolve_reply_target(bot_token, user_id, reply_msg_id, uid) if reply_msg_id else None
 
                     sent_photo = await context.bot.send_photo(
                         chat_id=uid,
@@ -1439,7 +1445,10 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     photo_id = update.message.photo[-1].file_id
-    set_user_state(bot_token, user_id, {"mode": "waiting_amount", "photo_id": photo_id})
+    state_data = {"mode": "waiting_amount", "photo_id": photo_id}
+    if update.message.reply_to_message:
+        state_data["reply_msg_id"] = update.message.reply_to_message.message_id
+    set_user_state(bot_token, user_id, state_data)
     await update.message.reply_text("Введите сумму чека (например 100 или 100.50):")
 
 
@@ -1460,11 +1469,16 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pseudonym = user_pseudonyms[bot_token][user_id]
 
-    if update.message.document and update.message.document.mime_type == "application/pdf":
-        doc_id = update.message.document.file_id
-        set_user_state(bot_token, user_id, {"mode": "waiting_amount", "document_id": doc_id})
-        await update.message.reply_text("Введите сумму чека (например 100 или 100.50):")
-        return
+    if update.message.document and update.message.document.mime_type:
+        mime = update.message.document.mime_type
+        if mime == "application/pdf" or mime.startswith("image/"):
+            doc_id = update.message.document.file_id
+            state_data = {"mode": "waiting_amount", "document_id": doc_id}
+            if update.message.reply_to_message:
+                state_data["reply_msg_id"] = update.message.reply_to_message.message_id
+            set_user_state(bot_token, user_id, state_data)
+            await update.message.reply_text("Введите сумму чека (например 100 или 100.50):")
+            return
 
     media_label = "[Медиа]"
     if update.message.video:
@@ -1478,19 +1492,9 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.document:
         media_label = "[Файл]"
 
-    root_entry = None
+    reply_msg_id = None
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
-        original = message_map.get(bot_token, {}).get((user_id, reply_msg_id))
-        if original:
-            if "sent_to" in original:
-                root_entry = original
-            elif "sender_msg_id" in original:
-                sender_entry = message_map.get(bot_token, {}).get(
-                    (original["sender_id"], original["sender_msg_id"])
-                )
-                if sender_entry:
-                    root_entry = sender_entry
 
     if bot_token not in message_map:
         message_map[bot_token] = {}
@@ -1505,12 +1509,7 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for uid in user_pseudonyms[bot_token].keys():
         if uid != user_id:
             try:
-                target_reply_id = None
-                if root_entry:
-                    if uid in root_entry.get("sent_to", {}):
-                        target_reply_id = root_entry["sent_to"][uid]
-                    elif root_entry.get("sender_id") == uid:
-                        target_reply_id = root_entry.get("sender_msg_id")
+                target_reply_id = resolve_reply_target(bot_token, user_id, reply_msg_id, uid) if reply_msg_id else None
 
                 sent_media = None
                 if update.message.video:
