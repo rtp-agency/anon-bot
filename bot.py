@@ -1168,14 +1168,21 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         status_text = f"Статус: Принят ✅\nИзменён: {editor_name} ({format_amount(old_amount)} → {format_amount(new_amount)})"
 
         action_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")]
+            [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")],
+            [InlineKeyboardButton("💬 Комментарий", callback_data=f"receipt_comment_{receipt_id}")]
         ])
+
+        comments_text = ""
+        if receipt_data.get("comments"):
+            comments_text = "\n\n💬 Комментарии:"
+            for c in receipt_data["comments"]:
+                comments_text += f"\n{c['pseudonym']}: {c['text']}"
 
         if "message_ids" in receipt_data:
             for uid, msg_id in receipt_data["message_ids"].items():
                 try:
                     if "photo_id" in receipt_data or "document_id" in receipt_data:
-                        new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
+                        new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}{comments_text}"
                         await bot_to_use.edit_message_caption(
                             chat_id=uid,
                             message_id=msg_id,
@@ -1183,7 +1190,7 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                             reply_markup=action_markup
                         )
                     else:
-                        new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
+                        new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}{comments_text}"
                         await bot_to_use.edit_message_text(
                             chat_id=uid,
                             message_id=msg_id,
@@ -1196,6 +1203,93 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         set_user_state(bot_token, user_id, None)
         await update.message.reply_text(f"✅ Сумма чека изменена: {format_amount(old_amount)} → {format_amount(new_amount)} {currency}")
         logger.info(f"Receipt {receipt_id} edited by {editor_name}: {old_amount} -> {new_amount}")
+        return
+
+    if state and state.get("mode") == "waiting_receipt_comment":
+        receipt_id = state.get("receipt_id")
+        if receipt_id not in receipts:
+            await update.message.reply_text("❌ Чек не найден")
+            set_user_state(bot_token, user_id, None)
+            return
+
+        receipt_data = receipts[receipt_id]
+        commenter_name = user_pseudonyms.get(bot_token, {}).get(user_id, "Неизвестный")
+
+        if "comments" not in receipt_data:
+            receipt_data["comments"] = []
+        receipt_data["comments"].append({"pseudonym": commenter_name, "text": text})
+
+        bot_app = None
+        for cid, bot_info in created_bots.items():
+            if bot_info["token"] == receipt_data.get("bot_token"):
+                bot_app = bot_info["application"]
+                break
+        bot_to_use = bot_app.bot if bot_app else context.bot
+
+        status = receipt_data.get("status", "pending")
+        status_map = {"pending": "Статус: Ожидание", "approved": "Статус: Принят ✅", "declined": "Статус: Отклонён ❌"}
+        status_text = status_map.get(status, "Статус: Ожидание")
+
+        if receipt_data.get("edited_by"):
+            old_amount = receipt_data.get("amount")
+            status_text += f"\nИзменён: {receipt_data['edited_by']}"
+
+        currency = receipt_data.get("currency") or get_bot_currency(bot_token)
+        if is_working_hours(bot_token):
+            daily_total = db_get_daily_total(bot_token)
+            daily_line = f"\nИтого за смену: {format_amount(daily_total)} {currency}"
+        else:
+            shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
+            daily_line = f"\nНерабочее время (смена: {shift['start']}:00–{shift['end']}:00 МСК)"
+
+        comments_text = "\n\n💬 Комментарии:"
+        for c in receipt_data["comments"]:
+            comments_text += f"\n{c['pseudonym']}: {c['text']}"
+
+        comment_btn = [InlineKeyboardButton("💬 Комментарий", callback_data=f"receipt_comment_{receipt_id}")]
+        if status == "pending":
+            action_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Принять", callback_data=f"receipt_approve_{receipt_id}")],
+                [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")],
+                comment_btn
+            ])
+        elif status == "approved":
+            action_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")],
+                comment_btn
+            ])
+        elif status == "declined":
+            action_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Назад", callback_data=f"receipt_undo_{receipt_id}")],
+                comment_btn
+            ])
+        else:
+            action_markup = InlineKeyboardMarkup([comment_btn])
+
+        if "message_ids" in receipt_data:
+            for uid, msg_id in receipt_data["message_ids"].items():
+                try:
+                    if "photo_id" in receipt_data or "document_id" in receipt_data:
+                        new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}{comments_text}"
+                        await bot_to_use.edit_message_caption(
+                            chat_id=uid,
+                            message_id=msg_id,
+                            caption=new_caption,
+                            reply_markup=action_markup
+                        )
+                    else:
+                        new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}{comments_text}"
+                        await bot_to_use.edit_message_text(
+                            chat_id=uid,
+                            message_id=msg_id,
+                            text=new_text,
+                            reply_markup=action_markup
+                        )
+                except Exception as e:
+                    logger.error(f"Error updating receipt comment for {uid}: {e}")
+
+        set_user_state(bot_token, user_id, None)
+        await update.message.reply_text("✅ Комментарий добавлен", reply_markup=get_main_keyboard(is_admin))
         return
 
     if state and state.get("mode") == "waiting_amount":
@@ -1219,7 +1313,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         keyboard = [
             [InlineKeyboardButton("✅ Принять", callback_data=f"receipt_approve_{receipt_id}")],
-            [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")]
+            [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")],
+            [InlineKeyboardButton("💬 Комментарий", callback_data=f"receipt_comment_{receipt_id}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1632,6 +1727,10 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         receipt_data["status"] = "pending"
         status_text = "Статус: Ожидание"
         await query.answer("Чек возвращён на рассмотрение!")
+    elif action == "comment":
+        set_user_state(bot_token, approver_id, {"mode": "waiting_receipt_comment", "receipt_id": receipt_id})
+        await query.answer(f"Введите текст комментария", show_alert=True)
+        return
     else:
         return
 
@@ -1696,27 +1795,37 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shift = bot_shifts.get(bot_token, {"start": 0, "end": 23})
         daily_line = f"\nНерабочее время (смена: {shift['start']}:00–{shift['end']}:00 МСК)"
 
+    comment_btn = [InlineKeyboardButton("💬 Комментарий", callback_data=f"receipt_comment_{receipt_id}")]
     if action == "approve":
         action_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")]
+            [InlineKeyboardButton("✏️ Изменить", callback_data=f"receipt_edit_{receipt_id}")],
+            comment_btn
         ])
     elif action == "decline":
         action_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩️ Назад", callback_data=f"receipt_undo_{receipt_id}")]
+            [InlineKeyboardButton("↩️ Назад", callback_data=f"receipt_undo_{receipt_id}")],
+            comment_btn
         ])
     elif action == "undo":
         action_markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Принять", callback_data=f"receipt_approve_{receipt_id}")],
-            [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")]
+            [InlineKeyboardButton("❌ Отклонить", callback_data=f"receipt_decline_{receipt_id}")],
+            comment_btn
         ])
     else:
         action_markup = None
+
+    comments_text = ""
+    if receipt_data.get("comments"):
+        comments_text = "\n\n💬 Комментарии:"
+        for c in receipt_data["comments"]:
+            comments_text += f"\n{c['pseudonym']}: {c['text']}"
 
     if "message_ids" in receipt_data:
         for uid, msg_id in receipt_data["message_ids"].items():
             try:
                 if "photo_id" in receipt_data or "document_id" in receipt_data:
-                    new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
+                    new_caption = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}{comments_text}"
                     await bot_to_use.edit_message_caption(
                         chat_id=uid,
                         message_id=msg_id,
@@ -1724,7 +1833,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=action_markup
                     )
                 else:
-                    new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}"
+                    new_text = f"{receipt_data['pseudonym']}: {receipt_data['text']}\n\nНовый чек\n{status_text}{daily_line}{comments_text}"
                     await bot_to_use.edit_message_text(
                         chat_id=uid,
                         message_id=msg_id,
@@ -1749,6 +1858,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notify_text = None
 
     if notify_text:
+        receipt_msg_ids = receipt_data.get("message_ids", {})
         notify_ids = set()
         if owner_id:
             notify_ids.add(owner_id)
@@ -1756,7 +1866,8 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notify_ids.discard(approver_id)
         for uid in notify_ids:
             try:
-                await bot_to_use.send_message(chat_id=uid, text=notify_text)
+                reply_to = receipt_msg_ids.get(uid)
+                await bot_to_use.send_message(chat_id=uid, text=notify_text, reply_to_message_id=reply_to)
             except Exception as e:
                 logger.error(f"Error sending receipt notification to {uid}: {e}")
 
