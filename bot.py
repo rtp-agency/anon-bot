@@ -1348,7 +1348,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         photo=photo_id,
                         caption=caption,
                         reply_markup=reply_markup,
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                 elif document_id:
                     sent = await context.bot.send_document(
@@ -1356,7 +1357,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         document=document_id,
                         caption=caption,
                         reply_markup=reply_markup,
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                 else:
                     continue
@@ -1453,7 +1455,8 @@ async def secret_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 sent = await context.bot.send_message(
                     chat_id=uid,
                     text=message_text,
-                    reply_to_message_id=target_reply_id
+                    reply_to_message_id=target_reply_id,
+                    allow_sending_without_reply=True
                 )
                 message_map[bot_token][sender_key]["sent_to"][uid] = sent.message_id
                 message_map[bot_token][(uid, sent.message_id)] = {
@@ -1525,7 +1528,8 @@ async def secret_chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=uid,
                         photo=update.message.photo[-1].file_id,
                         caption=f"{pseudonym}:",
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                     message_map[bot_token][(user_id, update.message.message_id)]["sent_to"][uid] = sent_photo.message_id
                     message_map[bot_token][(uid, sent_photo.message_id)] = {
@@ -1612,34 +1616,39 @@ async def secret_chat_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=uid,
                         video=update.message.video.file_id,
                         caption=f"{pseudonym}:",
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                 elif update.message.video_note:
                     sent_media = await context.bot.send_video_note(
                         chat_id=uid,
                         video_note=update.message.video_note.file_id,
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                 elif update.message.voice:
                     sent_media = await context.bot.send_voice(
                         chat_id=uid,
                         voice=update.message.voice.file_id,
                         caption=f"{pseudonym}:",
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                 elif update.message.audio:
                     sent_media = await context.bot.send_audio(
                         chat_id=uid,
                         audio=update.message.audio.file_id,
                         caption=f"{pseudonym}:",
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
                 elif update.message.document:
                     sent_media = await context.bot.send_document(
                         chat_id=uid,
                         document=update.message.document.file_id,
                         caption=f"{pseudonym}:",
-                        reply_to_message_id=target_reply_id
+                        reply_to_message_id=target_reply_id,
+                        allow_sending_without_reply=True
                     )
 
                 if sent_media:
@@ -1867,7 +1876,12 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for uid in notify_ids:
             try:
                 reply_to = receipt_msg_ids.get(uid)
-                await bot_to_use.send_message(chat_id=uid, text=notify_text, reply_to_message_id=reply_to)
+                await bot_to_use.send_message(
+                    chat_id=uid,
+                    text=notify_text,
+                    reply_to_message_id=reply_to,
+                    allow_sending_without_reply=True
+                )
             except Exception as e:
                 logger.error(f"Error sending receipt notification to {uid}: {e}")
 
