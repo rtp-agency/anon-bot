@@ -2,4 +2,8 @@ credentials.json
 venv/
 .claude/
 data.db
+data.db.*
 .env
+*.log
+__pycache__/
+*.pyc

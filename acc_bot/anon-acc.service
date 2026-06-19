@@ -1,0 +1,17 @@
+[Unit]
+Description=Accounting / Reporting Telegram Bot
+After=network.target
+
+[Service]
+LimitNOFILE=65536
+User=root
+Group=root
+WorkingDirectory=/home/anon-bot-acc
+ExecStart=/home/anon-bot/venv/bin/python3 /home/anon-bot-acc/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/anon-acc.log
+StandardError=append:/var/log/anon-acc.log
+
+[Install]
+WantedBy=multi-user.target
